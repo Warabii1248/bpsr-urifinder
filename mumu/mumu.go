@@ -1,0 +1,641 @@
+// Package mumu はMuMu Playerエミュレーターに対してADB経由でチャンネル切替を行う。
+// uribo-discord-watcher/src/mumu.rs をGo移植したもの。
+package mumu
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+// Config はADB操作の設定
+type Config struct {
+	ADBPath     string
+	TapX        int
+	TapY        int
+	ClearLength int
+	PreKeycode  string
+	GlobalDelay time.Duration
+	// ParallelLimit は同時に実行するチャンネル切替の最大並列数。
+	// 0 = 無制限（デバイス数分すべて並列、グループディレイも無効）。
+	ParallelLimit int
+	// ParallelGroupDelay は各グループの開始前に挿入するウェイト。
+	// ParallelLimit > 0 のときのみ有効。最初のグループはディレイなし。
+	// 例: ParallelLimit=2, ParallelGroupDelay=3s, 6台 →
+	//   t=0s: 台1・台2開始 / t=3s: 台3・台4開始 / t=6s: 台5・台6開始
+	ParallelGroupDelay time.Duration
+}
+
+// DefaultConfig はデフォルト値を返す
+func DefaultConfig() Config {
+	return Config{
+		ADBPath:            "adb",
+		TapX:               975,
+		TapY:               664,
+		ClearLength:        3,
+		PreKeycode:         "KEYCODE_P",
+		GlobalDelay:        800 * time.Millisecond,
+		ParallelLimit:      0,
+		ParallelGroupDelay: 0,
+	}
+}
+
+// newCmd は HideWindow: true でコマンドを作成する（GUIモード時のコンソール点滅防止）
+func newCmd(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return cmd
+}
+
+func runAdb(cfg Config, args ...string) (string, error) {
+	cmd := newCmd(cfg.ADBPath, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("adb %v: %w\n%s", args, err, string(out))
+	}
+	if cfg.GlobalDelay > 0 {
+		time.Sleep(cfg.GlobalDelay)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func adb(serial string, cfg Config, args ...string) (string, error) {
+	full := append([]string{"-s", serial}, args...)
+	return runAdb(cfg, full...)
+}
+
+// RestartServer は adb kill-server → adb start-server でADBサーバーを再起動する。
+// ADB接続が切れた場合の復旧に使用する。
+func RestartServer(cfg Config) error {
+	log.Println("[MuMu] adb kill-server...")
+	// kill-server は失敗しても無視（既に停止済みの場合あり）
+	_ = newCmd(cfg.ADBPath, "kill-server").Run()
+	time.Sleep(500 * time.Millisecond)
+
+	log.Println("[MuMu] adb start-server...")
+	out, err := newCmd(cfg.ADBPath, "start-server").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("adb start-server: %w\n%s", err, string(out))
+	}
+	log.Println("[MuMu] ADBサーバー再起動完了")
+	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+
+// ListDevices は接続中のADBデバイス一覧を返す。
+// ADBサーバーの再起動は行わない（通常の取得に使用）。
+func ListDevices(cfg Config) ([]string, error) {
+	log.Println("[MuMu] デバイス一覧を取得中...")
+	devices, err := listDevicesOnce(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if len(devices) == 0 {
+		log.Println("[MuMu] デバイスが見つかりません。ADBでエミュレーターが認識されているか確認してください")
+	}
+	return devices, nil
+}
+
+// ListDevicesWithRestart は adb kill-server/start-server でADBサーバーを再起動してから
+// デバイス一覧を返す。接続が切れた場合の復旧用。
+func ListDevicesWithRestart(cfg Config) ([]string, error) {
+	if restartErr := RestartServer(cfg); restartErr != nil {
+		log.Printf("[MuMu] ADB再起動失敗: %v", restartErr)
+	}
+	return ListDevices(cfg)
+}
+
+func listDevicesOnce(cfg Config) ([]string, error) {
+	out, err := runAdb(cfg, "devices")
+	if err != nil {
+		log.Printf("[MuMu] adb devices 失敗: %v", err)
+		return nil, err
+	}
+	// 生出力を全行ログ（\n 展開して見やすく）
+	log.Printf("[MuMu] adb devices 出力:\n%s", out)
+
+	var devices []string
+	var offline []string
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		switch parts[1] {
+		case "device":
+			devices = append(devices, parts[0])
+		case "offline", "unauthorized":
+			offline = append(offline, parts[0]+"("+parts[1]+")")
+		}
+	}
+	if len(offline) > 0 {
+		log.Printf("[MuMu] 接続不可デバイス: %v", offline)
+	}
+	log.Printf("[MuMu] 有効デバイス: %v (%d台)", devices, len(devices))
+	return devices, nil
+}
+
+// SwitchChannel は指定デバイスを指定チャンネルに切り替える。
+// 失敗した場合は adb kill-server/start-server で復旧してリトライする。
+func SwitchChannel(serial string, channel uint32, cfg Config) error {
+	err := switchChannelOnce(serial, channel, cfg)
+	if err != nil {
+		log.Printf("[MuMu] switch_channel失敗(%v)、ADBサーバーを再起動してリトライ...", err)
+		if restartErr := RestartServer(cfg); restartErr != nil {
+			log.Printf("[MuMu] ADB再起動失敗: %v", restartErr)
+			return err // 再起動失敗なら元のエラーを返す
+		}
+		return switchChannelOnce(serial, channel, cfg)
+	}
+	return nil
+}
+
+func switchChannelOnce(serial string, channel uint32, cfg Config) error {
+	log.Printf("[MuMu] switch_channel: serial=%s channel=%d", serial, channel)
+
+	// Pキーでチャンネル入力を開く
+	if cfg.PreKeycode != "" {
+		if _, err := adb(serial, cfg, "shell", "input", "keyevent", cfg.PreKeycode); err != nil {
+			return fmt.Errorf("pre_keycode: %w", err)
+		}
+	}
+
+	// タップで入力欄をフォーカス
+	if cfg.TapX > 0 && cfg.TapY > 0 {
+		tapArgs := []string{"shell", "input", "tap",
+			fmt.Sprintf("%d", cfg.TapX),
+			fmt.Sprintf("%d", cfg.TapY),
+		}
+		if _, err := adb(serial, cfg, tapArgs...); err != nil {
+			return fmt.Errorf("tap: %w", err)
+		}
+	}
+
+	// 既存テキストを削除
+	for i := 0; i < cfg.ClearLength; i++ {
+		if _, err := adb(serial, cfg, "shell", "input", "keyevent", "KEYCODE_DEL"); err != nil {
+			return fmt.Errorf("clear[%d]: %w", i, err)
+		}
+	}
+
+	// チャンネル番号を入力
+	if _, err := adb(serial, cfg, "shell", "input", "text", fmt.Sprintf("%d", channel)); err != nil {
+		return fmt.Errorf("input text: %w", err)
+	}
+
+	// Enterで確定
+	if _, err := adb(serial, cfg, "shell", "input", "keyevent", "KEYCODE_ENTER"); err != nil {
+		return fmt.Errorf("enter: %w", err)
+	}
+
+	// Pキーでチャンネル入力を閉じる（満員時のダイアログも閉じる）
+	if cfg.PreKeycode != "" {
+		if _, err := adb(serial, cfg, "shell", "input", "keyevent", cfg.PreKeycode); err != nil {
+			return fmt.Errorf("pre_keycode: %w", err)
+		}
+	}
+
+	log.Printf("[MuMu] switch_channel done: serial=%s channel=%d", serial, channel)
+	return nil
+}
+
+// parallelLimit は cfg.ParallelLimit が 0（無制限）のとき total を返すヘルパー。
+// ParallelLimit > total の場合は total に丸める（無制限扱いにはしない）。
+func parallelLimit(cfg Config, total int) int {
+	if cfg.ParallelLimit <= 0 {
+		return total // 0 = 無制限
+	}
+	if cfg.ParallelLimit > total {
+		return total // 上限がデバイス数より多い場合は全台
+	}
+	return cfg.ParallelLimit
+}
+
+// switchGroup は serials[start:end] を並列で切り替え、全完了を待つ。
+func switchGroup(serials []string, start, end int, channel uint32, cfg Config, results map[string]error, mu *sync.Mutex) {
+	var wg sync.WaitGroup
+	for i := start; i < end; i++ {
+		s := serials[i]
+		wg.Add(1)
+		go func(serial string) {
+			defer wg.Done()
+			err := SwitchChannel(serial, channel, cfg)
+			mu.Lock()
+			results[serial] = err
+			mu.Unlock()
+		}(s)
+	}
+	wg.Wait()
+}
+
+// SwitchAll は全デバイスを同じチャンネルに切り替える。
+// cfg.ParallelLimit > 0 の場合、デバイスを N台ずつのグループに分けて順番に実行し、
+// グループ間に cfg.ParallelGroupDelay のディレイを挿入する。
+// cfg.ParallelLimit == 0（無制限）の場合は全台同時に実行する。
+func SwitchAll(serials []string, channel uint32, cfg Config) map[string]error {
+	results := make(map[string]error, len(serials))
+	var mu sync.Mutex
+
+	limit := parallelLimit(cfg, len(serials))
+	log.Printf("[MuMu] SwitchAll: %d台 グループ=%d台 グループ間ディレイ=%.1fs ch=%d",
+		len(serials), limit, cfg.ParallelGroupDelay.Seconds(), channel)
+
+	for start := 0; start < len(serials); start += limit {
+		end := start + limit
+		if end > len(serials) {
+			end = len(serials)
+		}
+		groupNum := start/limit + 1
+		log.Printf("[MuMu] SwitchAll グループ%d: %v", groupNum, serials[start:end])
+
+		// 最初のグループはディレイなし、2グループ目以降にディレイを挿入
+		if start > 0 && cfg.ParallelGroupDelay > 0 {
+			log.Printf("[MuMu] SwitchAll グループ間ディレイ %.1fs 待機中...", cfg.ParallelGroupDelay.Seconds())
+			time.Sleep(cfg.ParallelGroupDelay)
+		}
+
+		switchGroup(serials, start, end, channel, cfg, results, &mu)
+	}
+	return results
+}
+
+// GetDeviceIP は指定デバイスの仮想NWインターフェースIPを返す。
+// "adb -s <serial> shell ip route get 1" の出力から src フィールドをパースする。
+func GetDeviceIP(serial string, cfg Config) (string, error) {
+	cmd := newCmd(cfg.ADBPath, "-s", serial, "shell", "ip", "route", "get", "1")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("ip route get: %w", err)
+	}
+	// 例: "1.0.0.0 via 10.0.2.2 dev eth0 src 192.168.9.101 uid 0"
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "src" && i+1 < len(fields) {
+				ip := fields[i+1]
+				// ローカルループバックはスキップ
+				if ip != "127.0.0.1" && ip != "::1" {
+					return ip, nil
+				}
+			}
+		}
+	}
+	return "", fmt.Errorf("could not parse IP from adb output: %q", strings.TrimSpace(string(out)))
+}
+
+// ───── チャンネルリスト ─────
+
+// LoadChannels はファイルからチャンネル番号リストを読み込む。
+// カンマ区切りまたは1行1番号の形式に対応する。
+func LoadChannels(path string) ([]uint32, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var channels []uint32
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// カンマ区切り対応
+		for _, part := range strings.Split(line, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			n, err := strconv.ParseUint(part, 10, 32)
+			if err != nil {
+				continue
+			}
+			channels = append(channels, uint32(n))
+		}
+	}
+	return channels, scanner.Err()
+}
+
+// SaveChannels は channels を 1行1番号のテキストとして path に上書き保存する。
+func SaveChannels(path string, channels []uint32) error {
+	var sb strings.Builder
+	for _, ch := range channels {
+		sb.WriteString(strconv.FormatUint(uint64(ch), 10))
+		sb.WriteByte('\n')
+	}
+	return os.WriteFile(path, []byte(sb.String()), 0644)
+}
+
+// ───── 巡回（パトロール） ─────
+
+// PatrolStatus は現在の巡回状態
+type PatrolStatus struct {
+	Running            bool     `json:"running"`
+	CurrentChannel     uint32   `json:"current_channel"`
+	CurrentIndex       int      `json:"current_index"`
+	TotalChannels      int      `json:"total_channels"`
+	Serials            []string `json:"serials"`
+	DwellSecs          float64  `json:"dwell_secs"`
+	ParallelLimit      int      `json:"parallel_limit"`
+	ParallelGroupDelay float64  `json:"parallel_group_delay"`
+	LastChannel        uint32   `json:"last_channel"` // 最後に巡回したチャンネル
+	Reversed           bool     `json:"reversed"`     // 逆順巡回中
+	LoopMode           bool     `json:"loop_mode"`    // true=ループ / false=一巡で停止
+}
+
+// PatrolOptions は巡回の追加オプション
+type PatrolOptions struct {
+	Reversed     bool   // true=逆順（末尾→先頭方向）
+	LoopMode     bool   // true=ループ継続 / false=一巡で自動停止
+	StartChannel uint32 // 0=前回位置から再開 / >0=指定チャンネルから開始
+}
+
+// Patroller はチャンネル巡回を管理する
+type Patroller struct {
+	cfg         Config
+	mu          sync.RWMutex
+	status      PatrolStatus
+	cancel      context.CancelFunc
+	lastChannel uint32 // 最後に巡回したチャンネル（再開位置の計算に使用）
+}
+
+// NewPatroller はPatrollerを作成する
+func NewPatroller(cfg Config) *Patroller {
+	return &Patroller{cfg: cfg}
+}
+
+// UpdateConfig は実行中の設定（ParallelLimit等）を動的に更新する。
+// 巡回中の場合は次のチャンネルから新しい設定が反映される。
+func (p *Patroller) UpdateConfig(cfg Config) {
+	p.mu.Lock()
+	p.cfg = cfg
+	p.mu.Unlock()
+}
+
+// Status は現在の巡回状態を返す
+func (p *Patroller) Status() PatrolStatus {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.status
+}
+
+// Stop は巡回を停止する
+func (p *Patroller) Stop() {
+	p.mu.Lock()
+	if p.cancel != nil {
+		p.cancel()
+		p.cancel = nil
+	}
+	// 停止時に最後のチャンネルを保存（再開位置の計算に使用）
+	if p.status.CurrentChannel > 0 {
+		p.lastChannel = p.status.CurrentChannel
+	}
+	p.status.LastChannel = p.lastChannel
+	p.status.Running = false
+	p.mu.Unlock()
+	log.Println("[MuMu] 巡回停止")
+}
+
+// findResumeIndex はチャンネルリストから再開インデックスを決定する。
+// lastCh がリストに存在すればそのインデックスを返す。
+// 存在しない場合は lastCh に最も近い値のインデックスを返す。
+// lastCh が 0（初回起動）の場合は 0 を返す。
+func findResumeIndex(channels []uint32, lastCh uint32) int {
+	if lastCh == 0 || len(channels) == 0 {
+		return 0
+	}
+	// 完全一致を優先
+	for i, ch := range channels {
+		if ch == lastCh {
+			return i
+		}
+	}
+	// 最近傍を探す
+	bestIdx := 0
+	bestDiff := absDiffUint32(channels[0], lastCh)
+	for i, ch := range channels[1:] {
+		if d := absDiffUint32(ch, lastCh); d < bestDiff {
+			bestDiff = d
+			bestIdx = i + 1
+		}
+	}
+	return bestIdx
+}
+
+func absDiffUint32(a, b uint32) uint32 {
+	if a >= b {
+		return a - b
+	}
+	return b - a
+}
+
+// Start は指定デバイス・チャンネルリストで巡回を開始する。
+// opts で巡回方向・ループモード・開始チャンネルを指定できる。
+// すでに巡回中の場合は停止してから再起動する。
+// serials が空の場合は adb devices で自動検出する。
+// channels が空の場合は何もしない。
+// channelsFile が指定されている場合、各チャンネル滞在後にファイル更新を確認し
+// 変更があれば近傍チャンネルから巡回し直す。
+func (p *Patroller) Start(serials []string, channels []uint32, dwellSecs float64, channelsFile string, opts PatrolOptions) {
+	if len(channels) == 0 {
+		log.Println("[MuMu] 巡回: チャンネルリストが空のため開始しない")
+		return
+	}
+	p.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// 開始インデックスの決定
+	// StartChannel > 0 なら指定チャンネル優先、それ以外は前回位置から再開
+	var resumeIdx int
+	if opts.StartChannel > 0 {
+		resumeIdx = findResumeIndex(channels, opts.StartChannel)
+	} else {
+		resumeIdx = findResumeIndex(channels, p.lastChannel)
+	}
+
+	// 逆順の場合: リストをそのままにインデックス操作で逆走する
+	// step = +1(正順) / -1(逆順)
+	step := 1
+	if opts.Reversed {
+		step = -1
+		// 逆順開始時は末尾から（開始Ch指定がなければ）
+		if opts.StartChannel == 0 && p.lastChannel == 0 {
+			resumeIdx = len(channels) - 1
+		}
+	}
+
+	p.mu.Lock()
+	p.cancel = cancel
+	p.status = PatrolStatus{
+		Running:            true,
+		TotalChannels:      len(channels),
+		Serials:            serials,
+		DwellSecs:          dwellSecs,
+		ParallelLimit:      p.cfg.ParallelLimit,
+		ParallelGroupDelay: p.cfg.ParallelGroupDelay.Seconds(),
+		LastChannel:        p.lastChannel,
+		Reversed:           opts.Reversed,
+		LoopMode:           opts.LoopMode,
+	}
+	p.mu.Unlock()
+
+	dwell := time.Duration(float64(time.Second) * dwellSecs)
+	if dwell < 100*time.Millisecond {
+		dwell = 5 * time.Second
+	}
+
+	// channels.txt の初回モッドタイムを記録
+	var lastModTime time.Time
+	if channelsFile != "" {
+		if fi, err := os.Stat(channelsFile); err == nil {
+			lastModTime = fi.ModTime()
+		}
+	}
+
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			p.status.Running = false
+			p.mu.Unlock()
+			log.Println("[MuMu] 巡回終了")
+		}()
+
+		dirStr := "正順"
+		if opts.Reversed {
+			dirStr = "逆順"
+		}
+		modeStr := "ループ"
+		if !opts.LoopMode {
+			modeStr = "一巡"
+		}
+		log.Printf("[MuMu] 巡回開始: %d ch, 滞在=%.1fs, 方向=%s, モード=%s, 開始idx=%d",
+			len(channels), dwellSecs, dirStr, modeStr, resumeIdx)
+
+		idx := resumeIdx
+		visited := 0 // 一巡モード用カウンタ
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			// インデックスを範囲内に正規化（負数対応）
+			n := len(channels)
+			normalIdx := ((idx % n) + n) % n
+			ch := channels[normalIdx]
+
+			// 一巡モード: 全チャンネルを回し終えたら停止
+			if !opts.LoopMode && visited >= n {
+				log.Println("[MuMu] 巡回: 一巡完了、自動停止")
+				return
+			}
+
+			// デバイス一覧を取得（空なら自動検出）
+			targets := serials
+			if len(targets) == 0 {
+				var err error
+				targets, err = ListDevices(p.cfg)
+				if err != nil {
+					log.Printf("[MuMu] 巡回: デバイス取得失敗: %v", err)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(3 * time.Second):
+					}
+					continue
+				}
+				if len(targets) == 0 {
+					log.Println("[MuMu] 巡回: 対象デバイスが0台。MuMu Playerが起動しているか確認してください")
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(5 * time.Second):
+					}
+					continue
+				}
+			}
+
+			p.mu.Lock()
+			currentCfg := p.cfg
+			p.status.CurrentChannel = ch
+			p.status.CurrentIndex = normalIdx
+			p.status.Serials = targets
+			p.status.ParallelLimit = currentCfg.ParallelLimit
+			p.status.ParallelGroupDelay = currentCfg.ParallelGroupDelay.Seconds()
+			p.lastChannel = ch
+			p.status.LastChannel = ch
+			p.mu.Unlock()
+
+			limit := parallelLimit(currentCfg, len(targets))
+			log.Printf("[MuMu] 巡回: [%d/%d] Ch%d → %d台 (グループ=%d, ディレイ=%.1fs)",
+				normalIdx+1, n, ch, len(targets), limit, currentCfg.ParallelGroupDelay.Seconds())
+
+			// デバイスをグループに分けて順番に切り替える
+			patrolResults := make(map[string]error, len(targets))
+			var patrolMu sync.Mutex
+			for start := 0; start < len(targets); start += limit {
+				end := start + limit
+				if end > len(targets) {
+					end = len(targets)
+				}
+				if start > 0 && currentCfg.ParallelGroupDelay > 0 {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(currentCfg.ParallelGroupDelay):
+					}
+				}
+				switchGroup(targets, start, end, ch, currentCfg, patrolResults, &patrolMu)
+			}
+			for serial, err := range patrolResults {
+				if err != nil {
+					log.Printf("[MuMu] 巡回: serial=%s ch=%d 失敗: %v", serial, ch, err)
+				} else {
+					log.Printf("[MuMu] 巡回: serial=%s ch=%d OK", serial, ch)
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(dwell):
+			}
+
+			// channels.txt が更新されていたら近傍から再巡回
+			if channelsFile != "" {
+				if fi, statErr := os.Stat(channelsFile); statErr == nil && fi.ModTime().After(lastModTime) {
+					if newChs, loadErr := LoadChannels(channelsFile); loadErr == nil && len(newChs) > 0 {
+						newIdx := findResumeIndex(newChs, ch)
+						log.Printf("[MuMu] channels.txt 更新検知: %d → %d ch、Ch%d 近傍(idx=%d)から再巡回",
+							len(channels), len(newChs), ch, newIdx)
+						channels = newChs
+						idx = newIdx
+						visited = 0
+						lastModTime = fi.ModTime()
+						p.mu.Lock()
+						p.status.TotalChannels = len(channels)
+						p.mu.Unlock()
+						continue
+					} else if loadErr != nil {
+						log.Printf("[MuMu] channels.txt リロード失敗: %v", loadErr)
+					}
+				}
+			}
+
+			visited++
+			idx += step
+		}
+	}()
+}
