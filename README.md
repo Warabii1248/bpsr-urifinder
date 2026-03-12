@@ -1,5 +1,11 @@
 # LoyalBoarlet Monitor
 
+下記プロジェクトの改変版です。
+
+https://github.com/yukkuman/bpsr-loyal-emu
+
+このバージョンでは巡回機能の強化、操作性改善が含まれています。
+
 複数インスタンスでスターレゾナンスでゴールドウリボを自動検知し、Discordへ通知するツール。
 
 ---
