@@ -908,6 +908,51 @@ function minimizePanel(id) {
   const btn = p.querySelector('.panel-btn');
   if (p.classList.toggle('minimized')) { btn.textContent='＋'; btn.title='展開'; }
   else { btn.textContent='─'; btn.title='最小化'; }
+  saveLayout();
+}
+
+// ── Layout persistence ──
+const LAYOUT_KEY = 'loyalboarlet_layout';
+function saveLayout() {
+  const L = document.getElementById('col-left');
+  const R = document.getElementById('col-right');
+  const totalW = L.getBoundingClientRect().width + R.getBoundingClientRect().width;
+  const leftRatio = totalW > 0 ? L.getBoundingClientRect().width / totalW : 0.57;
+  const layout = {
+    leftRatio,
+    left:  [...L.querySelectorAll('.panel')].map(p=>({id:p.id, minimized:p.classList.contains('minimized')})),
+    right: [...R.querySelectorAll('.panel')].map(p=>({id:p.id, minimized:p.classList.contains('minimized')})),
+  };
+  try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)); } catch(_){}
+}
+function restoreLayout() {
+  let layout;
+  try { layout = JSON.parse(localStorage.getItem(LAYOUT_KEY)||'null'); } catch(_){}
+  if (!layout) return;
+  const L = document.getElementById('col-left');
+  const R = document.getElementById('col-right');
+  // カラム幅比率を復元
+  if (layout.leftRatio) {
+    L.style.flex = layout.leftRatio + ' 1 0';
+    R.style.flex = (1 - layout.leftRatio) + ' 1 0';
+  }
+  // パネルの順番・最小化状態を復元
+  [[L, layout.left],[R, layout.right]].forEach(([col, entries])=>{
+    if (!entries) return;
+    entries.forEach(({id, minimized})=>{
+      const panel = document.getElementById(id);
+      if (!panel) return;
+      col.appendChild(panel); // 順番通りに付け直す
+      const btn = panel.querySelector('.panel-btn');
+      if (minimized) {
+        panel.classList.add('minimized');
+        if (btn) { btn.textContent='＋'; btn.title='展開'; }
+      } else {
+        panel.classList.remove('minimized');
+        if (btn) { btn.textContent='─'; btn.title='最小化'; }
+      }
+    });
+  });
 }
 
 // ── Splitter ──
@@ -938,6 +983,7 @@ function minimizePanel(id) {
     if(!drag) return;
     drag=false; sp.classList.remove('active');
     document.body.style.cursor='';
+    saveLayout();
   });
 })();
 
@@ -955,6 +1001,7 @@ document.querySelectorAll('.panel-header[draggable]').forEach(h=>{
     if(dragPanel) dragPanel.style.opacity='';
     dragPanel=null;
     dropInd.classList.remove('visible');
+    saveLayout();
   });
 });
 document.querySelectorAll('.panel').forEach(p=>{
@@ -1191,6 +1238,7 @@ async function saveConfig(){
 }
 
 // ── Init ──
+restoreLayout();
 refreshDevices();
 setInterval(refreshDevices,10000);
 loadPatrolChannels();
