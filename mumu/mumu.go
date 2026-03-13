@@ -209,7 +209,7 @@ func switchChannelOnce(serial string, channel uint32, cfg Config) error {
 
 // parallelLimit は cfg.ParallelLimit が 0（無制限）のとき total を返すヘルパー。
 // ParallelLimit > total の場合は total に丸める（無制限扱いにはしない）。
-func parallelLimit(cfg Config, total int) int {
+func ParallelLimit(cfg Config, total int) int {
 	if cfg.ParallelLimit <= 0 {
 		return total // 0 = 無制限
 	}
@@ -220,7 +220,7 @@ func parallelLimit(cfg Config, total int) int {
 }
 
 // switchGroup は serials[start:end] を並列で切り替え、全完了を待つ。
-func switchGroup(serials []string, start, end int, channel uint32, cfg Config, results map[string]error, mu *sync.Mutex) {
+func SwitchGroup(serials []string, start, end int, channel uint32, cfg Config, results map[string]error, mu *sync.Mutex) {
 	var wg sync.WaitGroup
 	for i := start; i < end; i++ {
 		s := serials[i]
@@ -234,37 +234,6 @@ func switchGroup(serials []string, start, end int, channel uint32, cfg Config, r
 		}(s)
 	}
 	wg.Wait()
-}
-
-// SwitchAll は全デバイスを同じチャンネルに切り替える。
-// cfg.ParallelLimit > 0 の場合、デバイスを N台ずつのグループに分けて順番に実行し、
-// グループ間に cfg.ParallelGroupDelay のディレイを挿入する。
-// cfg.ParallelLimit == 0（無制限）の場合は全台同時に実行する。
-func SwitchAll(serials []string, channel uint32, cfg Config) map[string]error {
-	results := make(map[string]error, len(serials))
-	var mu sync.Mutex
-
-	limit := parallelLimit(cfg, len(serials))
-	log.Printf("[MuMu] SwitchAll: %d台 グループ=%d台 グループ間ディレイ=%.1fs ch=%d",
-		len(serials), limit, cfg.ParallelGroupDelay.Seconds(), channel)
-
-	for start := 0; start < len(serials); start += limit {
-		end := start + limit
-		if end > len(serials) {
-			end = len(serials)
-		}
-		groupNum := start/limit + 1
-		log.Printf("[MuMu] SwitchAll グループ%d: %v", groupNum, serials[start:end])
-
-		// 最初のグループはディレイなし、2グループ目以降にディレイを挿入
-		if start > 0 && cfg.ParallelGroupDelay > 0 {
-			log.Printf("[MuMu] SwitchAll グループ間ディレイ %.1fs 待機中...", cfg.ParallelGroupDelay.Seconds())
-			time.Sleep(cfg.ParallelGroupDelay)
-		}
-
-		switchGroup(serials, start, end, channel, cfg, results, &mu)
-	}
-	return results
 }
 
 // GetDeviceIP は指定デバイスの仮想NWインターフェースIPを返す。
@@ -368,8 +337,8 @@ type Patroller struct {
 	mu          sync.RWMutex
 	status      PatrolStatus
 	cancel      context.CancelFunc
-	lastChannel uint32        // 最後に巡回したチャンネル（再開位置の計算に使用）
-	moveSignal  chan struct{} // ch移動完了パケット([0x2E])受信ごとに1送信
+	lastChannel uint32         // 最後に巡回したチャンネル（再開位置の計算に使用）
+	moveSignal  chan time.Time // ch移動完了パケット([0x2E])受信ごとに受信時刻を送信
 }
 
 // NotifyChMovePacket は ncap が [0x2E] パケットを受信したときに呼び出す。
@@ -383,7 +352,7 @@ func (p *Patroller) NotifyChMovePacket() {
 		return
 	}
 	select {
-	case ch <- struct{}{}:
+	case ch <- time.Now():
 	default: // バッファ満杯なら捨てる（ブロックしない）
 	}
 }
@@ -391,6 +360,13 @@ func (p *Patroller) NotifyChMovePacket() {
 // NewPatroller はPatrollerを作成する
 func NewPatroller(cfg Config) *Patroller {
 	return &Patroller{cfg: cfg}
+}
+
+// Config は現在の設定をスレッドセーフに返す。
+func (p *Patroller) Config() Config {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.cfg
 }
 
 // UpdateConfig は実行中の設定（ParallelLimit等）を動的に更新する。
@@ -408,14 +384,19 @@ func (p *Patroller) Status() PatrolStatus {
 	return p.status
 }
 
+// ClearFullChannels は満員判定リストをクリアする
+func (p *Patroller) ClearFullChannels() {
+	p.mu.Lock()
+	p.status.FullChannels = nil
+	p.mu.Unlock()
+	log.Println("[MuMu] 満員チャンネルリストをクリアしました")
+}
+
 // Stop は巡回を停止する
 func (p *Patroller) Stop() {
 	p.mu.Lock()
-	if p.cancel != nil {
-		p.cancel()
-		p.cancel = nil
-	}
-	// 停止時に最後のチャンネルを保存（再開位置の計算に使用）
+	cancel := p.cancel
+	p.cancel = nil
 	if p.status.CurrentChannel > 0 {
 		p.lastChannel = p.status.CurrentChannel
 	}
@@ -424,6 +405,9 @@ func (p *Patroller) Stop() {
 	p.status.WaitingMove = false
 	p.moveSignal = nil
 	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	log.Println("[MuMu] 巡回停止")
 }
 
@@ -502,8 +486,8 @@ func (p *Patroller) Start(serials []string, channels []uint32, channelsFile stri
 		dwell = 5 * time.Second
 	}
 
-	// moveSignal: [0x2E]パケット受信ごとに1トークンをバッファリング
-	sig := make(chan struct{}, 64)
+	// moveSignal: [0x2E]パケット受信ごとに受信時刻をバッファリング
+	sig := make(chan time.Time, 64)
 
 	p.mu.Lock()
 	p.cancel = cancel
@@ -624,25 +608,18 @@ func (p *Patroller) Start(serials []string, channels []uint32, channelsFile stri
 			p.status.LastChannel = ch
 			p.mu.Unlock()
 
-			limit := parallelLimit(currentCfg, len(targets))
+			limit := ParallelLimit(currentCfg, len(targets))
 			// ParallelLimit=0（無制限）のとき グループ間ディレイは無効
 			groupDelay := currentCfg.ParallelGroupDelay
 			if currentCfg.ParallelLimit <= 0 {
 				groupDelay = 0
 			}
-			log.Printf("[MuMu] 巡回: [%d/%d] Ch%d → %d台 (グループ=%d台, ディレイ=%.1fs, 滞在=%.0fs)",
-				normalIdx+1, n, ch, len(targets), limit,
+			log.Printf("[MuMu] 巡回: [%d/%d] Ch%d → %d台 (ParallelLimit=%d, グループ=%d台, ディレイ=%.1fs, 滞在=%.0fs)",
+				normalIdx+1, n, ch, len(targets), currentCfg.ParallelLimit, limit,
 				groupDelay.Seconds(), dwell.Seconds())
 
-			// moveSignal のバッファをフラッシュ（前回の残滓を除去）
-		flushSig:
-			for {
-				select {
-				case <-sig:
-				default:
-					break flushSig
-				}
-			}
+			// 切替開始時刻を記録（この時刻以降に届いた[0x2E]のみ有効）
+			switchStartAt := time.Now()
 
 			// デバイスをグループに分けて並列切替
 			patrolResults := make(map[string]error, len(targets))
@@ -653,14 +630,18 @@ func (p *Patroller) Start(serials []string, channels []uint32, channelsFile stri
 					end = len(targets)
 				}
 				if start > 0 && groupDelay > 0 {
+					log.Printf("[MuMu] 巡回: グループ間ディレイ %.1fs 待機中... (グループ%d)", groupDelay.Seconds(), start/limit+1)
 					select {
 					case <-ctx.Done():
 						return
 					case <-time.After(groupDelay):
 					}
 				}
-				switchGroup(targets, start, end, ch, currentCfg, patrolResults, &patrolMu)
+				SwitchGroup(targets, start, end, ch, currentCfg, patrolResults, &patrolMu)
 			}
+			// 全台切替完了時刻を記録（この時刻以降の[0x2E]のみカウント）
+			switchDoneAt := time.Now()
+
 			failCount := 0
 			for serial, err := range patrolResults {
 				if err != nil {
@@ -675,6 +656,7 @@ func (p *Patroller) Start(serials []string, channels []uint32, channelsFile stri
 			}
 
 			// ── ch移動完了待ち（[0x2E]シグナル） ──
+			// 切替開始時刻以降に届いたシグナルをカウント（フラッシュ不要）
 			// タイムアウトした場合は満員と判定してスキップ
 			isFull := false
 			if currentCfg.MoveTimeout > 0 {
@@ -683,20 +665,31 @@ func (p *Patroller) Start(serials []string, channels []uint32, channelsFile stri
 				p.mu.Lock()
 				p.status.WaitingMove = true
 				p.mu.Unlock()
-				log.Printf("[MuMu] 巡回: Ch%d 移動完了待ち (0/%d台, タイムアウト=%.0fs)",
-					ch, need, currentCfg.MoveTimeout.Seconds())
+				log.Printf("[MuMu] 巡回: Ch%d 移動完了待ち (0/%d台, タイムアウト=%.0fs, 切替所要=%.1fs)",
+					ch, need, currentCfg.MoveTimeout.Seconds(), switchDoneAt.Sub(switchStartAt).Seconds())
+
+				// バッファに溜まっている切替開始以降のシグナルを先に消化
+				draining := true
+				for draining && got < need {
+					select {
+					case t := <-sig:
+						if t.After(switchStartAt) {
+							got++
+							log.Printf("[MuMu] 巡回: Ch%d [0x2E] buffered (%d/%d台)", ch, got, need)
+						}
+					default:
+						draining = false
+					}
+				}
+
 				deadline := time.NewTimer(currentCfg.MoveTimeout)
 			waitLoop:
 				for got < need {
 					select {
 					case <-ctx.Done():
 						deadline.Stop()
-						p.mu.Lock()
-						p.status.WaitingMove = false
-						p.mu.Unlock()
 						return
 					case <-deadline.C:
-						// タイムアウト＝シグナルが1件も来ていない → 満員と判定
 						if got == 0 {
 							isFull = true
 							log.Printf("[MuMu] 巡回: Ch%d 満員と判定（移動完了シグナルなし） → スキップ", ch)
@@ -704,16 +697,17 @@ func (p *Patroller) Start(serials []string, channels []uint32, channelsFile stri
 							log.Printf("[MuMu] 巡回: Ch%d 移動待ちタイムアウト (%d/%d台) → 強制進行", ch, got, need)
 						}
 						break waitLoop
-					case <-sig:
-						got++
-						log.Printf("[MuMu] 巡回: Ch%d [0x2E] (%d/%d台)", ch, got, need)
+					case t := <-sig:
+						if t.After(switchStartAt) {
+							got++
+							log.Printf("[MuMu] 巡回: Ch%d [0x2E] (%d/%d台)", ch, got, need)
+						}
 					}
 				}
 				deadline.Stop()
 				p.mu.Lock()
 				p.status.WaitingMove = false
 				if isFull {
-					// 満員リストに追加（重複なし）
 					alreadyIn := false
 					for _, fc := range p.status.FullChannels {
 						if fc == ch {
@@ -749,16 +743,42 @@ func (p *Patroller) Start(serials []string, channels []uint32, channelsFile stri
 			if channelsFile != "" {
 				if fi, statErr := os.Stat(channelsFile); statErr == nil && fi.ModTime().After(lastModTime) {
 					if newChs, loadErr := LoadChannels(channelsFile); loadErr == nil && len(newChs) > 0 {
-						newIdx := findResumeIndex(newChs, ch)
-						log.Printf("[MuMu] channels.txt 更新検知: %d → %d ch、Ch%d 近傍(idx=%d)から再巡回",
-							len(channels), len(newChs), ch, newIdx)
+						lastModTime = fi.ModTime()
+						// 現在のchが削除されていたか確認
+						currentChRemoved := true
+						for _, c := range newChs {
+							if c == ch {
+								currentChRemoved = false
+								break
+							}
+						}
+						var newIdx int
+						if currentChRemoved {
+							// 削除済みなのでそのまま次のインデックスへ進める
+							// 旧リストでの次インデックスに最も近いchを新リストから探す
+							nextCh := uint32(0)
+							nextNormalIdx := (((idx + step) % len(channels)) + len(channels)) % len(channels)
+							nextCh = channels[nextNormalIdx]
+							newIdx = findResumeIndex(newChs, nextCh)
+							log.Printf("[MuMu] channels.txt 更新検知: Ch%d は削除済み → 次Ch%d(idx=%d)から継続",
+								ch, nextCh, newIdx)
+						} else {
+							newIdx = findResumeIndex(newChs, ch)
+							log.Printf("[MuMu] channels.txt 更新検知: %d → %d ch、Ch%d 近傍(idx=%d)から再巡回",
+								len(channels), len(newChs), ch, newIdx)
+						}
 						channels = newChs
 						idx = newIdx
 						visited = 0
-						lastModTime = fi.ModTime()
 						p.mu.Lock()
 						p.status.TotalChannels = len(channels)
 						p.mu.Unlock()
+						// 削除済みの場合は既に次chのidxを指しているのでそのまま continue
+						// 現在chが残っている場合は通常通り idx+=step してから continue
+						if !currentChRemoved {
+							visited++
+							idx += step
+						}
 						continue
 					} else if loadErr != nil {
 						log.Printf("[MuMu] channels.txt リロード失敗: %v", loadErr)

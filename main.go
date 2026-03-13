@@ -222,17 +222,6 @@ func main() {
 		},
 	)
 
-	// 時間系設定の Patroller へのリアルタイム反映
-	guiServer.SetCfgUpdater(func(dwellSecs, moveTimeoutSecs, groupDelaySecs float64, parallelLimit int) {
-		newCfg := mumuCfg
-		newCfg.DwellDuration = time.Duration(dwellSecs * float64(time.Second))
-		newCfg.MoveTimeout = time.Duration(moveTimeoutSecs * float64(time.Second))
-		newCfg.ParallelGroupDelay = time.Duration(groupDelaySecs * float64(time.Second))
-		newCfg.ParallelLimit = parallelLimit
-		mumuCfg = newCfg
-		guiServer.UpdatePatrollerCfg(newCfg)
-	})
-
 	go func() {
 		if startErr := capDevice.Start(); startErr != nil {
 			log.Println("capture stopped:", startErr)
@@ -252,6 +241,8 @@ func main() {
 		if err := guiServer.RunWindow(ctx); err != nil {
 			log.Printf("GUI error: %v", err)
 		}
+		// ウィンドウが閉じられたら明示的にキャンセル（goroutine終了）
+		cancel()
 	} else {
 		log.Println("GUI disabled (gui_port=0)")
 		sig := make(chan os.Signal, 1)

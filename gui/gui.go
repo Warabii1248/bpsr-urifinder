@@ -3,6 +3,7 @@
 package gui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -35,23 +36,18 @@ type DeviceSessionInfo struct {
 // Server はGUI用HTTPサーバー
 type Server struct {
 	port               int
-	mumuCfg            mumu.Config
 	patroller          *mumu.Patroller
 	patrolChannels     []uint32 // 起動時に設定から読み込んだチャンネルリスト
-	// patrolDwellSecs は cfg.PatrolDwellSecs に移行（廃止）
 	patrolChannelsFile string   // channels.txt パス（ホットリロード用）
-	getSessions        func() []DeviceSessionInfo // ADB ↔ UID 対応用セッション提供コールバック
-	testDetectFn       func()                     // テスト検知発火コールバック
-	saveChannelsFn     func([]uint32) error        // channels.txt 保存コールバック
-	getConfigFn        func() ([]byte, error)      // config.json 読み込みコールバック
-	saveConfigFn       func([]byte) error          // config.json 保存コールバック
-	// cfgUpdaterFn は config.json 保存後に呼ばれ、時間系設定を Patroller にリアルタイム反映する
-	cfgUpdaterFn       func(dwellSecs, moveTimeoutSecs, groupDelaySecs float64, parallelLimit int)
+	getSessions        func() []DeviceSessionInfo
+	testDetectFn       func()
+	saveChannelsFn     func([]uint32) error
+	getConfigFn        func() ([]byte, error)
+	saveConfigFn       func([]byte) error
 
-	cfgMu    sync.RWMutex // mumuCfg 専用ミューテックス
-	mu       sync.RWMutex
-	logLines       []string      // 検知ログ（最大200件）
-	clients        []chan string // SSEクライアント
+	mu              sync.RWMutex
+	logLines        []string        // 検知ログ（最大200件）
+	clients         []chan string   // SSEクライアント
 	goldBoarHistory []GoldBoarEvent // 金ウリボ検知履歴（最大50件）
 }
 
@@ -62,25 +58,10 @@ type GoldBoarEvent struct {
 	Location string `json:"location"`
 }
 
-// getMumuCfg は mumuCfg をスレッドセーフに取得する
-func (s *Server) getMumuCfg() mumu.Config {
-	s.cfgMu.RLock()
-	defer s.cfgMu.RUnlock()
-	return s.mumuCfg
-}
-
-// setMumuCfg は mumuCfg をスレッドセーフに更新する
-func (s *Server) setMumuCfg(cfg mumu.Config) {
-	s.cfgMu.Lock()
-	s.mumuCfg = cfg
-	s.cfgMu.Unlock()
-}
-
 // New はGUIサーバーを作成する
 func New(port int, mumuCfg mumu.Config, patrolChannels []uint32, patrolChannelsFile string) *Server {
 	return &Server{
 		port:               port,
-		mumuCfg:            mumuCfg,
 		patroller:          mumu.NewPatroller(mumuCfg),
 		patrolChannels:     patrolChannels,
 		patrolChannelsFile: patrolChannelsFile,
@@ -108,11 +89,6 @@ func (s *Server) SetConfigFns(getFn func() ([]byte, error), saveFn func([]byte) 
 	s.saveConfigFn = saveFn
 }
 
-// SetCfgUpdater は config.json 保存後に時間系設定を Patroller へリアルタイム反映するコールバックを設定する。
-func (s *Server) SetCfgUpdater(fn func(dwellSecs, moveTimeoutSecs, groupDelaySecs float64, parallelLimit int)) {
-	s.cfgUpdaterFn = fn
-}
-
 // NotifyChMovePacket は ncap が [0x2E] パケットを受信したとき main.go から呼ぶ。
 // 巡回中であれば Patroller に移動完了シグナルを転送する。
 func (s *Server) NotifyChMovePacket() {
@@ -120,9 +96,7 @@ func (s *Server) NotifyChMovePacket() {
 }
 
 // UpdatePatrollerCfg は Patroller の設定をリアルタイムで更新する。
-// SetCfgUpdater コールバック内から呼ぶ。
 func (s *Server) UpdatePatrollerCfg(cfg mumu.Config) {
-	s.setMumuCfg(cfg)
 	s.patroller.UpdateConfig(cfg)
 }
 
@@ -159,17 +133,19 @@ func (s *Server) OnDetect(det notifier.Detection) {
 	}
 	if removed {
 		s.patrolChannels = newChs
-		log.Printf("[GUI] 金ウリボ検知: Ch%d を巡回リストから削除 (残%d ch)", detCh, len(newChs))
 	}
 	saveChannelsFn := s.saveChannelsFn
 	clients := make([]chan string, len(s.clients))
 	copy(clients, s.clients)
 	s.mu.Unlock()
 
-	// ファイルに保存（ロック外）
-	if removed && saveChannelsFn != nil {
-		if err := saveChannelsFn(newChs); err != nil {
-			log.Printf("[GUI] channels.txt 保存失敗: %v", err)
+	// ロック外で log.Printf（guiWriter 経由で再ロックするためデッドロック回避）
+	if removed {
+		log.Printf("[GUI] 金ウリボ検知: Ch%d を巡回リストから削除 (残%d ch)", detCh, len(newChs))
+		if saveChannelsFn != nil {
+			if err := saveChannelsFn(newChs); err != nil {
+				log.Printf("[GUI] channels.txt 保存失敗: %v", err)
+			}
 		}
 	}
 	// SSEで全クライアントに通知
@@ -204,28 +180,22 @@ func (s *Server) AddLog(line string) {
 type guiWriter struct {
 	base io.Writer
 	srv  *Server
-	buf  []byte
+	buf  bytes.Buffer
 }
 
 func (w *guiWriter) Write(p []byte) (int, error) {
 	n, err := w.base.Write(p)
-	w.buf = append(w.buf, p...)
+	w.buf.Write(p)
 	for {
-		idx := -1
-		for i, b := range w.buf {
-			if b == '\n' {
-				idx = i
-				break
-			}
-		}
+		b := w.buf.Bytes()
+		idx := bytes.IndexByte(b, '\n')
 		if idx < 0 {
 			break
 		}
-		line := strings.TrimRight(string(w.buf[:idx]), "\r")
-		w.buf = w.buf[idx+1:]
+		line := strings.TrimRight(string(b[:idx]), "\r")
+		w.buf.Next(idx + 1)
 		if line != "" {
 			w.srv.AddLog(line)
-			// [0x2E] パケットログを検知して巡回の移動完了シグナルを送る
 			if strings.Contains(line, "[0x2E]") {
 				w.srv.patroller.NotifyChMovePacket()
 			}
@@ -250,6 +220,7 @@ func (s *Server) startHTTP(ctx context.Context) (string, error) {
 	mux.HandleFunc("/api/patrol/start", s.handlePatrolStart)
 	mux.HandleFunc("/api/patrol/stop", s.handlePatrolStop)
 	mux.HandleFunc("/api/patrol/status", s.handlePatrolStatus)
+	mux.HandleFunc("/api/patrol/clear-full", s.handlePatrolClearFull)
 	mux.HandleFunc("/api/patrol/channels", s.handlePatrolChannels)
 	mux.HandleFunc("/api/test-detect", s.handleTestDetect)
 	mux.HandleFunc("/api/config", s.handleConfig)
@@ -277,7 +248,7 @@ func (s *Server) startHTTP(ctx context.Context) (string, error) {
 	go func() {
 		time.Sleep(1 * time.Second)
 		log.Println("[MuMu] 起動時デバイス確認...")
-		devices, err := mumu.ListDevices(s.getMumuCfg())
+		devices, err := mumu.ListDevices(s.patroller.Config())
 		if err != nil {
 			log.Printf("[MuMu] 起動時デバイス取得失敗: %v", err)
 			return
@@ -354,7 +325,7 @@ func (s *Server) handleDeviceMap(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	adbDevices, err := mumu.ListDevices(s.getMumuCfg())
+	adbDevices, err := mumu.ListDevices(s.patroller.Config())
 	if err != nil {
 		log.Printf("[MuMu] device-map: ListDevices error: %v", err)
 		http.Error(w, err.Error(), 500)
@@ -389,7 +360,7 @@ func (s *Server) handleDeviceMap(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			ipCh := make(chan string, 1)
 			go func() {
-				ip, ipErr := mumu.GetDeviceIP(ser, s.getMumuCfg())
+				ip, ipErr := mumu.GetDeviceIP(ser, s.patroller.Config())
 				if ipErr != nil {
 					log.Printf("[MuMu] GetDeviceIP %s: %v", ser, ipErr)
 					ip = ""
@@ -421,7 +392,7 @@ func (s *Server) handleDeviceMap(w http.ResponseWriter, r *http.Request) {
 
 // handleDevices はADB接続デバイス一覧をJSONで返す
 func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
-	devices, err := mumu.ListDevices(s.getMumuCfg())
+	devices, err := mumu.ListDevices(s.patroller.Config())
 	if err != nil {
 		log.Printf("[MuMu] adb devices エラー: %v", err)
 	}
@@ -457,13 +428,27 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	}
 	var results []result
 
+	cfg := s.patroller.Config()
 	if req.All {
-		serials, err := mumu.ListDevices(s.getMumuCfg())
+		serials, err := mumu.ListDevices(cfg)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		for serial, err := range mumu.SwitchAll(serials, req.Channel, s.getMumuCfg()) {
+		switchResults := make(map[string]error, len(serials))
+		var switchMu sync.Mutex
+		limit := mumu.ParallelLimit(cfg, len(serials))
+		for start := 0; start < len(serials); start += limit {
+			end := start + limit
+			if end > len(serials) {
+				end = len(serials)
+			}
+			if start > 0 && cfg.ParallelGroupDelay > 0 {
+				time.Sleep(cfg.ParallelGroupDelay)
+			}
+			mumu.SwitchGroup(serials, start, end, req.Channel, cfg, switchResults, &switchMu)
+		}
+		for serial, err := range switchResults {
 			r := result{Serial: serial, OK: err == nil}
 			if err != nil {
 				r.Error = err.Error()
@@ -471,7 +456,7 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 			results = append(results, r)
 		}
 	} else {
-		err := mumu.SwitchChannel(req.Serial, req.Channel, s.getMumuCfg())
+		err := mumu.SwitchChannel(req.Serial, req.Channel, cfg)
 		r := result{Serial: req.Serial, OK: err == nil}
 		if err != nil {
 			r.Error = err.Error()
@@ -561,35 +546,39 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("[GUI] config.json を保存しました")
 
-		// 時間系設定をPatrollerにリアルタイム反映
-		if s.cfgUpdaterFn != nil {
-			var raw map[string]json.RawMessage
-			if json.Unmarshal(buf, &raw) == nil {
-				getF64 := func(key string, def float64) float64 {
-					if v, ok := raw[key]; ok {
-						var f float64
-						if json.Unmarshal(v, &f) == nil {
-							return f
-						}
-					}
-					return def
+		// 保存した config を読み直して Patroller に即時反映
+		if s.getConfigFn != nil {
+			if savedData, rerr := s.getConfigFn(); rerr == nil {
+				var appCfg struct {
+					ADBPath                string  `json:"adb_path"`
+					MumuTapX               int     `json:"mumu_tap_x"`
+					MumuTapY               int     `json:"mumu_tap_y"`
+					MumuClearLength        int     `json:"mumu_clear_length"`
+					MumuPreKeycode         string  `json:"mumu_pre_keycode"`
+					MumuDelayMs            int     `json:"mumu_delay_ms"`
+					ParallelLimit          int     `json:"parallel_limit"`
+					ParallelGroupDelaySecs float64 `json:"parallel_group_delay_secs"`
+					PatrolMoveTimeoutSecs  float64 `json:"patrol_move_timeout_secs"`
+					PatrolDwellSecs        float64 `json:"patrol_dwell_secs"`
 				}
-				getInt := func(key string, def int) int {
-					if v, ok := raw[key]; ok {
-						var i int
-						if json.Unmarshal(v, &i) == nil {
-							return i
-						}
+				if json.Unmarshal(savedData, &appCfg) == nil {
+					newCfg := mumu.Config{
+						ADBPath:            appCfg.ADBPath,
+						TapX:               appCfg.MumuTapX,
+						TapY:               appCfg.MumuTapY,
+						ClearLength:        appCfg.MumuClearLength,
+						PreKeycode:         appCfg.MumuPreKeycode,
+						GlobalDelay:        time.Duration(appCfg.MumuDelayMs) * time.Millisecond,
+						ParallelLimit:      appCfg.ParallelLimit,
+						ParallelGroupDelay: time.Duration(appCfg.ParallelGroupDelaySecs * float64(time.Second)),
+						MoveTimeout:        time.Duration(appCfg.PatrolMoveTimeoutSecs * float64(time.Second)),
+						DwellDuration:      time.Duration(appCfg.PatrolDwellSecs * float64(time.Second)),
 					}
-					return def
+					s.UpdatePatrollerCfg(newCfg)
+					log.Printf("[GUI] 巡回設定を即時反映: 滞在=%.0fs, タイムアウト=%.0fs, グループ間=%.0fs, 並列=%d",
+						appCfg.PatrolDwellSecs, appCfg.PatrolMoveTimeoutSecs,
+						appCfg.ParallelGroupDelaySecs, appCfg.ParallelLimit)
 				}
-				dwellSecs       := getF64("patrol_dwell_secs", 60)
-				moveTimeoutSecs := getF64("patrol_move_timeout_secs", 30)
-				groupDelaySecs  := getF64("parallel_group_delay_secs", 0)
-				parallelLimit   := getInt("parallel_limit", 0)
-				s.cfgUpdaterFn(dwellSecs, moveTimeoutSecs, groupDelaySecs, parallelLimit)
-				log.Printf("[GUI] 巡回設定を即時反映: 滞在=%.0fs, タイムアウト=%.0fs, グループ間=%.0fs, 並列=%d",
-					dwellSecs, moveTimeoutSecs, groupDelaySecs, parallelLimit)
 			}
 		}
 
@@ -629,7 +618,15 @@ func (s *Server) handlePatrolStart(w http.ResponseWriter, r *http.Request) {
 	}
 	channels := req.Channels
 	if len(channels) == 0 {
-		channels = s.patrolChannels
+		s.mu.RLock()
+		channels = make([]uint32, len(s.patrolChannels))
+		copy(channels, s.patrolChannels)
+		s.mu.RUnlock()
+	}
+	if len(channels) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": "チャンネルリストが空です"})
+		return
 	}
 	opts := mumu.PatrolOptions{
 		Reversed:     req.Reversed,
@@ -652,6 +649,17 @@ func (s *Server) handleTestDetect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	go s.testDetectFn()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+}
+
+// handlePatrolClearFull は満員判定リストをクリアする
+func (s *Server) handlePatrolClearFull(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+	s.patroller.ClearFullChannels()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
 }
@@ -727,7 +735,8 @@ const indexHTML = `<!DOCTYPE html>
 <title>LoyalBoarlet Monitor</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0a0a1a;color:#eaeaea;font-family:'Segoe UI',sans-serif;font-size:14px;height:100vh;width:100vw;overflow:hidden;user-select:none;display:flex;flex-direction:column}
+body{background:#0a0a1a;color:#eaeaea;font-family:'Segoe UI',sans-serif;font-size:14px;height:100vh;width:100vw;overflow:hidden;display:flex;flex-direction:column}
+.panel-header,.panel-btn,.panel-resizer,.splitter-h{user-select:none}
 h1{font-size:1.1em;padding:6px 12px;background:#0d1b33;border-bottom:1px solid #1a3a6a;display:flex;align-items:center;gap:8px;height:36px;flex-shrink:0}
 button{background:#1a3a6a;color:#eaeaea;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:0.88em;transition:background .15s}
 button:hover{background:#2a5aa0}
@@ -744,20 +753,23 @@ input[type=checkbox]{accent-color:#e94560;width:16px;height:16px}
 .flex-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 /* ─── Layout ─── */
 #workspace{display:flex;flex-direction:row;flex:1;overflow:hidden;min-height:0;width:100%}
-.panel-col{display:flex;flex-direction:column;overflow:hidden;min-width:200px;min-height:0}
+.panel-col{display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;min-width:200px;min-height:0}
 .splitter-h{width:5px;background:#1a3a6a;cursor:col-resize;flex-shrink:0}
 .splitter-h:hover,.splitter-h.active{background:#2a7ae0}
 /* ─── Panel ─── */
-.panel{display:flex;flex-direction:column;background:#0d1b33;border:1px solid #1a3a6a;border-radius:6px;margin:3px;overflow:hidden;transition:flex .15s}
-.panel.minimized{flex:none!important}
+.panel{display:flex;flex-direction:column;background:#0d1b33;border:1px solid #1a3a6a;border-radius:6px;margin:3px;overflow:hidden;transition:none;flex-shrink:0}
+.panel.flexible{flex-shrink:1;min-height:120px}
+.panel.minimized{flex:none!important;flex-shrink:0!important}
 .panel-header{display:flex;align-items:center;gap:6px;padding:5px 10px;background:#111e38;border-bottom:1px solid #1a3a6a;cursor:grab;flex-shrink:0;height:32px;border-radius:5px 5px 0 0}
 .panel-header:active{cursor:grabbing}
 .panel.minimized .panel-header{border-bottom:none;border-radius:5px}
 .panel-title{font-size:0.85em;font-weight:bold;flex:1;pointer-events:none;white-space:nowrap}
 .panel-btn{background:none;border:none;color:#aaa;cursor:pointer;padding:2px 6px;font-size:1em;border-radius:3px;line-height:1}
 .panel-btn:hover{background:#2a3a5a;color:#fff}
-.panel-body{flex:1;overflow-y:auto;padding:10px;min-height:0}
+.panel-body{flex:1;overflow-y:auto;padding:10px;min-height:0;flex-shrink:1}
 .panel.minimized .panel-body{display:none!important}
+.panel-resizer{height:5px;background:transparent;cursor:row-resize;flex-shrink:0;transition:background .15s}
+.panel-resizer:hover,.panel-resizer.active{background:#2a7ae0}
 /* Drop indicator */
 .drop-indicator{display:none;position:fixed;background:rgba(42,122,224,.3);border:2px dashed #2a7ae0;border-radius:4px;pointer-events:none;z-index:999}
 .drop-indicator.visible{display:block}
@@ -787,13 +799,17 @@ input[type=checkbox]{accent-color:#e94560;width:16px;height:16px}
 .cfg-note{font-size:0.75em;color:#606080;margin-top:4px}
 .check-label{display:flex;align-items:center;gap:6px;cursor:pointer;color:#eaeaea}
 .section-title{font-size:0.8em;color:#7ec8e3;font-weight:bold;margin:10px 0 4px;border-bottom:1px solid #1a3a6a;padding-bottom:3px}
-.gold-table{width:100%;border-collapse:collapse;font-size:0.82em}
-.gold-table th{color:#ffd700;text-align:left;padding:3px 8px;border-bottom:1px solid #1a3a6a;white-space:nowrap}
-.gold-table td{padding:4px 8px;border-bottom:1px solid #0d1530;vertical-align:top}
-.gold-table tr:hover td{background:#0d1b33}
-.gold-table .ch-cell{color:#7ec8e3;font-family:monospace;font-weight:bold;white-space:nowrap}
-.gold-table .time-cell{color:#a0a0b0;white-space:nowrap;font-size:0.85em}
+.gold-table{width:100%;border-collapse:collapse;font-size:0.82em;table-layout:fixed}
+.gold-table th{color:#ffd700;text-align:left;padding:3px 8px;border-bottom:1px solid #1a3a6a;white-space:nowrap;position:sticky;top:0;background:#0d1b33;z-index:1}
+.gold-table col.col-time{width:90px}
+.gold-table col.col-ch{width:50px}
+.gold-table td{padding:3px 8px;border-bottom:1px solid #0d1530;vertical-align:middle;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gold-table tr:hover td{background:#111e38}
+.gold-table .ch-cell{color:#7ec8e3;font-family:monospace;font-weight:bold}
+.gold-table .time-cell{color:#a0a0b0;font-size:0.85em}
 .no-history{color:#606080;font-size:0.85em;padding:8px 0}
+/* ヘッダー行高さ約22px + データ行3行×約22px = 88px。余裕を持たせて96px */
+#gold-history-container{max-height:96px;overflow-y:auto}
 </style>
 </head>
 <body>
@@ -808,7 +824,7 @@ input[type=checkbox]{accent-color:#e94560;width:16px;height:16px}
       </div>
       <div class="panel-body">
         <div class="flex-row">
-          <button onclick="refreshDevices()">🔄 再取得</button>
+          <button onclick="deviceFoundAt=null; refreshDevicesAuto(); if(!devicePollTimer) devicePollTimer=setInterval(refreshDevicesAuto,10000)">🔄 再取得</button>
           <label>一括 Ch:</label>
           <input type="number" id="allch" min="1" max="999" value="1" style="width:65px">
           <button onclick="switchAll()">▶ 全切替</button>
@@ -816,8 +832,9 @@ input[type=checkbox]{accent-color:#e94560;width:16px;height:16px}
         </div>
         <div class="device-list" id="device-list"><div class="no-devices">読み込み中...</div></div>
       </div>
+      <div class="panel-resizer" data-panel="panel-devices"></div>
     </div>
-    <div class="panel" id="panel-patrol" style="flex:2">
+    <div class="panel flexible" id="panel-patrol" style="flex:2">
       <div class="panel-header" draggable="true" data-panel="panel-patrol">
         <span class="panel-title">🔁 チャンネル巡回</span>
         <button class="panel-btn" onclick="minimizePanel('panel-patrol')" title="最小化">─</button>
@@ -829,7 +846,10 @@ input[type=checkbox]{accent-color:#e94560;width:16px;height:16px}
           <span id="ps-prog"></span>
           <span id="ps-parallel"></span>
         </div>
-        <div id="ps-full" style="font-size:0.78em;color:#e57373;min-height:1em;margin-bottom:6px"></div>
+        <div style="display:flex;align-items:center;gap:8px;min-height:1.2em;margin-bottom:6px">
+          <div id="ps-full" style="font-size:0.78em;color:#e57373;flex:1"></div>
+          <button id="btn-clear-full" class="secondary" style="font-size:0.75em;padding:2px 8px;display:none" onclick="clearFullChannels()">✕ クリア</button>
+        </div>
         <div class="flex-row" style="margin-bottom:8px">
           <label>開始Ch:</label>
           <input type="number" id="patrol-start-ch" min="0" max="9999" value="0" style="width:65px" title="0=前回位置から再開">
@@ -854,6 +874,7 @@ input[type=checkbox]{accent-color:#e94560;width:16px;height:16px}
           <button class="secondary" style="padding:3px 10px;font-size:0.8em;white-space:nowrap" onclick="bulkImportChannels()">上書き</button>
         </div>
       </div>
+      <div class="panel-resizer" data-panel="panel-patrol"></div>
     </div>
   </div>
 
@@ -869,8 +890,9 @@ input[type=checkbox]{accent-color:#e94560;width:16px;height:16px}
       <div class="panel-body">
         <div id="gold-history-container"><div class="no-history">検知履歴なし</div></div>
       </div>
+      <div class="panel-resizer" data-panel="panel-gold"></div>
     </div>
-    <div class="panel" id="panel-log" style="flex:2">
+    <div class="panel flexible" id="panel-log" style="flex:2">
       <div class="panel-header" draggable="true" data-panel="panel-log">
         <span class="panel-title">📋 検知ログ</span>
         <button class="panel-btn" onclick="minimizePanel('panel-log')" title="最小化">─</button>
@@ -882,6 +904,7 @@ input[type=checkbox]{accent-color:#e94560;width:16px;height:16px}
           <button style="font-size:0.8em;padding:3px 10px" onclick="testDetect()">🔔 テスト通知</button>
         </div>
       </div>
+      <div class="panel-resizer" data-panel="panel-log"></div>
     </div>
     <div class="panel" id="panel-config">
       <div class="panel-header" draggable="true" data-panel="panel-config">
@@ -896,6 +919,7 @@ input[type=checkbox]{accent-color:#e94560;width:16px;height:16px}
         </div>
         <p class="cfg-note">* 滞在時間・タイムアウト・並列設定は保存後すぐ反映されます。その他は再起動が必要です。</p>
       </div>
+      <div class="panel-resizer" data-panel="panel-config"></div>
     </div>
   </div>
 </div>
@@ -918,10 +942,15 @@ function saveLayout() {
   const R = document.getElementById('col-right');
   const totalW = L.getBoundingClientRect().width + R.getBoundingClientRect().width;
   const leftRatio = totalW > 0 ? L.getBoundingClientRect().width / totalW : 0.57;
+  const panelState = p => ({
+    id: p.id,
+    minimized: p.classList.contains('minimized'),
+    height: p.style.height || null
+  });
   const layout = {
     leftRatio,
-    left:  [...L.querySelectorAll('.panel')].map(p=>({id:p.id, minimized:p.classList.contains('minimized')})),
-    right: [...R.querySelectorAll('.panel')].map(p=>({id:p.id, minimized:p.classList.contains('minimized')})),
+    left:  [...L.querySelectorAll('.panel')].map(panelState),
+    right: [...R.querySelectorAll('.panel')].map(panelState),
   };
   try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)); } catch(_){}
 }
@@ -931,18 +960,16 @@ function restoreLayout() {
   if (!layout) return;
   const L = document.getElementById('col-left');
   const R = document.getElementById('col-right');
-  // カラム幅比率を復元
   if (layout.leftRatio) {
     L.style.flex = layout.leftRatio + ' 1 0';
     R.style.flex = (1 - layout.leftRatio) + ' 1 0';
   }
-  // パネルの順番・最小化状態を復元
   [[L, layout.left],[R, layout.right]].forEach(([col, entries])=>{
     if (!entries) return;
-    entries.forEach(({id, minimized})=>{
+    entries.forEach(({id, minimized, height})=>{
       const panel = document.getElementById(id);
       if (!panel) return;
-      col.appendChild(panel); // 順番通りに付け直す
+      col.appendChild(panel);
       const btn = panel.querySelector('.panel-btn');
       if (minimized) {
         panel.classList.add('minimized');
@@ -950,6 +977,7 @@ function restoreLayout() {
       } else {
         panel.classList.remove('minimized');
         if (btn) { btn.textContent='─'; btn.title='最小化'; }
+        if (height) { panel.style.flex='none'; panel.style.height=height; }
       }
     });
   });
@@ -987,7 +1015,38 @@ function restoreLayout() {
   });
 })();
 
-// ── Drag & Drop panels ──
+// ── Panel vertical resize ──
+(function(){
+  let dragging=null, startY=0, startH=0;
+  document.addEventListener('mousedown', e=>{
+    const rz=e.target.closest('.panel-resizer');
+    if(!rz) return;
+    const panel=rz.closest('.panel');
+    if(!panel||panel.classList.contains('minimized')) return;
+    dragging=panel;
+    startY=e.clientY;
+    startH=panel.getBoundingClientRect().height;
+    rz.classList.add('active');
+    document.body.style.cursor='row-resize';
+    // flex固定にして高さをpxで管理
+    panel.style.flex='none';
+    panel.style.height=startH+'px';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e=>{
+    if(!dragging) return;
+    const dy=e.clientY-startY;
+    const newH=Math.max(60, startH+dy);
+    dragging.style.height=newH+'px';
+  });
+  document.addEventListener('mouseup', e=>{
+    if(!dragging) return;
+    dragging.querySelector('.panel-resizer').classList.remove('active');
+    document.body.style.cursor='';
+    saveLayout();
+    dragging=null;
+  });
+})();
 let dragPanel=null;
 const dropInd=document.getElementById('drop-indicator');
 document.querySelectorAll('.panel-header[draggable]').forEach(h=>{
@@ -1046,7 +1105,8 @@ let selectedDevices=new Set();
 function selectedSerials(){ return [...selectedDevices]; }
 async function refreshDevices(){
   const r=await fetch('/api/devices');
-  const devs=await r.json();
+  const res=await r.json();
+  const devs=Array.isArray(res)?res:(res.devices||[]);
   const map=await fetch('/api/device-map').then(r=>r.json()).catch(()=>({}));
   const el=document.getElementById('device-list');
   if(!devs||devs.length===0){ el.innerHTML='<div class="no-devices">デバイスが見つかりません</div>'; return; }
@@ -1113,7 +1173,7 @@ async function loadGoldHistory(){
     const h=await fetch('/api/gold-history').then(r=>r.json());
     const c=document.getElementById('gold-history-container');
     if(!h||h.length===0){ c.innerHTML='<div class="no-history">検知履歴なし</div>'; return; }
-    c.innerHTML='<table class="gold-table"><thead><tr><th>時刻</th><th>Ch</th><th>場所</th></tr></thead><tbody>'
+    c.innerHTML='<table class="gold-table"><colgroup><col class="col-time"><col class="col-ch"><col></colgroup><thead><tr><th>時刻</th><th>Ch</th><th>場所</th></tr></thead><tbody>'
       +h.map(e=>'<tr><td class="time-cell">'+e.time+'</td><td class="ch-cell">Ch'+e.channel+'</td><td>'+e.location+'</td></tr>').join('')
       +'</tbody></table>';
   }catch(_){}
@@ -1158,12 +1218,23 @@ async function saveChannels(){
 function toggleReversed(){ patrolReversed=!patrolReversed; const b=document.getElementById('btn-reversed'); b.textContent=patrolReversed?'⬇ 逆順':'⬆ 正順'; b.classList.toggle('active',patrolReversed); }
 function toggleLoop(){ patrolLoopMode=!patrolLoopMode; const b=document.getElementById('btn-loop'); b.textContent=patrolLoopMode?'🔁 ループ':'1️⃣ 一巡'; b.classList.toggle('active',!patrolLoopMode); }
 async function patrolStart(){
-  const r=await fetch('/api/patrol/start',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({serials:selectedSerials(),channels:patrolChannels,reversed:patrolReversed,loop_mode:patrolLoopMode,start_channel:parseInt(document.getElementById('patrol-start-ch').value)||0})});
+  // channels が空なら送らない（Go側が s.patrolChannels を使う）
+  const chs = patrolChannels.length > 0 ? patrolChannels : [];
+  const body = {
+    serials: selectedSerials(),
+    reversed: patrolReversed,
+    loop_mode: patrolLoopMode,
+    start_channel: parseInt(document.getElementById('patrol-start-ch').value)||0
+  };
+  if(chs.length > 0) body.channels = chs;
+  const r=await fetch('/api/patrol/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const d=await r.json();
   if(!d.ok) alert('巡回開始失敗: '+(d.error||''));
 }
 async function patrolStop(){ await fetch('/api/patrol/stop',{method:'POST'}); }
+async function clearFullChannels(){
+  await fetch('/api/patrol/clear-full',{method:'POST'});
+}
 function updatePatrolUI(running){ document.getElementById('btn-patrol-start').disabled=running; document.getElementById('btn-patrol-stop').disabled=!running; }
 async function pollPatrolStatus(){
   try{
@@ -1189,9 +1260,19 @@ async function pollPatrolStatus(){
       updatePatrolUI(false);
     }
     const fullEl=document.getElementById('ps-full');
-    fullEl.textContent=(d.full_channels&&d.full_channels.length)?'🚫 満員スキップ: Ch'+d.full_channels.join(', Ch'):'';
-  }catch(_){}
-  setTimeout(pollPatrolStatus,2000);
+    const clearBtn=document.getElementById('btn-clear-full');
+    if(d.full_channels&&d.full_channels.length){
+      fullEl.textContent='🚫 満員スキップ: Ch'+d.full_channels.join(', Ch');
+      clearBtn.style.display='';
+    }else{
+      fullEl.textContent='';
+      clearBtn.style.display='none';
+    }
+  }catch(e){
+    console.warn('patrol status error:', e);
+  }finally{
+    setTimeout(pollPatrolStatus,2000);
+  }
 }
 
 // ── Config ──
@@ -1239,8 +1320,24 @@ async function saveConfig(){
 
 // ── Init ──
 restoreLayout();
-refreshDevices();
-setInterval(refreshDevices,10000);
+
+// デバイス自動取得：デバイスが見つかってから1分後に停止
+let devicePollTimer = null;
+let deviceFoundAt = null;
+async function refreshDevicesAuto() {
+  await refreshDevices();
+  const hasDev = document.querySelectorAll('#device-list .device-entry').length > 0;
+  if (hasDev && !deviceFoundAt) {
+    deviceFoundAt = Date.now();
+  }
+  if (deviceFoundAt && Date.now() - deviceFoundAt >= 60000) {
+    clearInterval(devicePollTimer);
+    devicePollTimer = null;
+  }
+}
+refreshDevicesAuto();
+devicePollTimer = setInterval(refreshDevicesAuto, 10000);
+
 loadPatrolChannels();
 pollPatrolStatus();
 loadConfig();
