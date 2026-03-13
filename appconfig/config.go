@@ -7,69 +7,61 @@ import (
 	"os"
 )
 
-// Config holds runtime settings loaded from config.json.
+// Config はアプリ全体の設定（config.json から読み書きされる）
 type Config struct {
-	// Network interface description; "auto" to auto-select the most active card.
+	// --- キャプチャ設定 ---
+
+	// Network はキャプチャするNICの説明文。"auto" で最アクティブなNICを自動選択。
 	Network string `json:"network"`
-
-	// Seconds to sample all interfaces when Network == "auto". Default: 3.
+	// AutoCheck は Network=="auto" のときサンプリングする秒数。デフォルト: 3
 	AutoCheck int `json:"auto_check"`
-
-	// Path to locations.json file. Default: "data/locations.json".
+	// Locations は locations.json のパス。デフォルト: "data/locations.json"
 	Locations string `json:"locations"`
 
-	// Discord Webhook URL. Leave empty to disable Discord notifications.
+	// --- 通知設定 ---
+
+	// DiscordWebhook は Discord の Webhook URL。空で無効。
 	DiscordWebhook string `json:"discord_webhook"`
-
-	// Seconds to suppress duplicate notifications for the same Ch+Location key.
-	// Default: 30.
+	// DebounceSeconds は同Ch+場所の重複通知を抑制する秒数。デフォルト: 30
 	DebounceSeconds int `json:"debounce_seconds"`
-
-	// ChatExclude is a list of keywords that, if found in a world-chat message,
-	// suppress the LoyalBoarlet detection. Useful for filtering false-positives.
-	// Example: ["いない", "終わった", "違う"]
+	// ChatExclude はワールドチャット検知を抑制するキーワード一覧。
 	ChatExclude []string `json:"chat_exclude"`
 
-	// --- GUI / MuMu Player 設定 ---
+	// --- GUI / ADB 設定 ---
 
 	// GUIPort はWebGUIのポート番号。0でGUI無効。デフォルト: 8080
 	GUIPort int `json:"gui_port"`
-
 	// ADBPath はadb.exeのパス。デフォルト: "adb"
 	ADBPath string `json:"adb_path"`
-
-	// MumuSerials はMuMu Player端末のADBシリアル一覧（例: ["127.0.0.1:16384","127.0.0.1:16416"]）
-	// 空の場合は "adb devices" で自動検出する
+	// MumuSerials はADBシリアル一覧。空の場合は自動検出。
 	MumuSerials []string `json:"mumu_serials"`
-
-	// MumuTapX, MumuTapY はチャンネル入力欄のタップ座標（MuMu標準解像度基準）
+	// MumuTapX, MumuTapY はチャンネル入力欄のタップ座標
 	MumuTapX int `json:"mumu_tap_x"`
 	MumuTapY int `json:"mumu_tap_y"`
-
-	// MumuClearLength は入力前にDELキーを送る回数（既存文字を消去）
+	// MumuClearLength は入力前にDELを送る回数
 	MumuClearLength int `json:"mumu_clear_length"`
-
-	// MumuPreKeycode はタップ前に送るキーコード（チャンネル入力欄を開く）
+	// MumuPreKeycode はタップ前に送るキーコード
 	MumuPreKeycode string `json:"mumu_pre_keycode"`
-
 	// MumuDelayMs は各ADBコマンド間のウェイト(ms)。デフォルト: 800
 	MumuDelayMs int `json:"mumu_delay_ms"`
-
-	// ParallelLimit は画面操作（チャンネル切替）の最大並列数。
-	// 0 = 無制限（デバイス数分すべて並列、グループディレイも無効）。デフォルト: 0
-	ParallelLimit int `json:"parallel_limit"`
-
-	// ParallelGroupDelay は各グループの切替開始前に挿入する待機時間（秒）。
-	// ParallelLimit > 0 のときのみ有効。最初のグループはディレイなし。デフォルト: 0
-	ParallelGroupDelayMs int `json:"parallel_group_delay_ms"`
 
 	// --- チャンネル巡回設定 ---
 
 	// PatrolChannelsFile はチャンネルリストファイルのパス。デフォルト: "channels.txt"
 	PatrolChannelsFile string `json:"patrol_channels_file"`
 
-	// PatrolDwellSecs は各チャンネルに滞在する秒数。デフォルト: 30
+	// PatrolDwellSecs はch移動完了後〜次ch移動開始までの待機秒数。デフォルト: 60
 	PatrolDwellSecs float64 `json:"patrol_dwell_secs"`
+
+	// PatrolMoveTimeoutSecs は[0x2E]パケットを待つ最大秒数。
+	// 時間内に全台分揃わなければ強制的に次へ進む。0=無効。デフォルト: 30
+	PatrolMoveTimeoutSecs float64 `json:"patrol_move_timeout_secs"`
+
+	// ParallelLimit は同時切替の最大台数。0=無制限（グループディレイも無効）。
+	ParallelLimit int `json:"parallel_limit"`
+
+	// ParallelGroupDelaySecs はグループ間の待機秒数。ParallelLimit>0のとき有効。
+	ParallelGroupDelaySecs float64 `json:"parallel_group_delay_secs"`
 
 	// PatrolSerials は巡回に使うADBシリアル一覧。空の場合は全デバイスを使用。
 	PatrolSerials []string `json:"patrol_serials"`
@@ -77,20 +69,21 @@ type Config struct {
 
 func defaultConfig() *Config {
 	return &Config{
-		AutoCheck:            3,
-		DebounceSeconds:      30,
-		Locations:            "data/locations.json",
-		GUIPort:              8080,
-		ADBPath:              "adb",
-		MumuTapX:             975,
-		MumuTapY:             664,
-		MumuClearLength:      3,
-		MumuPreKeycode:       "KEYCODE_P",
-		MumuDelayMs:          800,
-		ParallelLimit:        0,
-		ParallelGroupDelayMs: 0,
-		PatrolChannelsFile:   "channels.txt",
-		PatrolDwellSecs:      30,
+		AutoCheck:              3,
+		DebounceSeconds:        30,
+		Locations:              "data/locations.json",
+		GUIPort:                8080,
+		ADBPath:                "adb",
+		MumuTapX:               975,
+		MumuTapY:               664,
+		MumuClearLength:        3,
+		MumuPreKeycode:         "KEYCODE_P",
+		MumuDelayMs:            800,
+		ParallelLimit:          0,
+		ParallelGroupDelaySecs: 0,
+		PatrolChannelsFile:     "channels.txt",
+		PatrolDwellSecs:        60,
+		PatrolMoveTimeoutSecs:  30,
 	}
 }
 
@@ -138,6 +131,10 @@ func Load(path string) (*Config, error) {
 		cfg.MumuDelayMs = 800
 	}
 	// ParallelLimit: 0は有効値（無制限）なのでデフォルト補正しない
+	// 旧フィールド parallel_group_delay_ms からの移行
+	if cfg.ParallelGroupDelaySecs == 0 {
+		// 0は有効値（ディレイなし）なのでそのまま
+	}
 	return cfg, nil
 }
 

@@ -37,19 +37,29 @@ type Server struct {
 	port               int
 	mumuCfg            mumu.Config
 	patroller          *mumu.Patroller
-	patrolChannels     []uint32                   // 起動時に設定から読み込んだチャンネルリスト
-	patrolDwellSecs    float64                    // デフォルト滞在秒数
-	patrolChannelsFile string                     // channels.txt パス（ホットリロード用）
+	patrolChannels     []uint32 // 起動時に設定から読み込んだチャンネルリスト
+	// patrolDwellSecs は cfg.PatrolDwellSecs に移行（廃止）
+	patrolChannelsFile string   // channels.txt パス（ホットリロード用）
 	getSessions        func() []DeviceSessionInfo // ADB ↔ UID 対応用セッション提供コールバック
 	testDetectFn       func()                     // テスト検知発火コールバック
-	saveChannelsFn     func([]uint32) error       // channels.txt 保存コールバック
-	getConfigFn        func() ([]byte, error)     // config.json 読み込みコールバック
-	saveConfigFn       func([]byte) error         // config.json 保存コールバック
+	saveChannelsFn     func([]uint32) error        // channels.txt 保存コールバック
+	getConfigFn        func() ([]byte, error)      // config.json 読み込みコールバック
+	saveConfigFn       func([]byte) error          // config.json 保存コールバック
+	// cfgUpdaterFn は config.json 保存後に呼ばれ、時間系設定を Patroller にリアルタイム反映する
+	cfgUpdaterFn       func(dwellSecs, moveTimeoutSecs, groupDelaySecs float64, parallelLimit int)
 
 	cfgMu    sync.RWMutex // mumuCfg 専用ミューテックス
 	mu       sync.RWMutex
-	logLines []string      // 検知ログ（最大200件）
-	clients  []chan string // SSEクライアント
+	logLines       []string      // 検知ログ（最大200件）
+	clients        []chan string // SSEクライアント
+	goldBoarHistory []GoldBoarEvent // 金ウリボ検知履歴（最大50件）
+}
+
+// GoldBoarEvent は金ウリボ検知の1件分の記録
+type GoldBoarEvent struct {
+	Time     string `json:"time"`
+	Channel  uint32 `json:"channel"`
+	Location string `json:"location"`
 }
 
 // getMumuCfg は mumuCfg をスレッドセーフに取得する
@@ -67,13 +77,12 @@ func (s *Server) setMumuCfg(cfg mumu.Config) {
 }
 
 // New はGUIサーバーを作成する
-func New(port int, mumuCfg mumu.Config, patrolChannels []uint32, patrolDwellSecs float64, patrolChannelsFile string) *Server {
+func New(port int, mumuCfg mumu.Config, patrolChannels []uint32, patrolChannelsFile string) *Server {
 	return &Server{
 		port:               port,
 		mumuCfg:            mumuCfg,
 		patroller:          mumu.NewPatroller(mumuCfg),
 		patrolChannels:     patrolChannels,
-		patrolDwellSecs:    patrolDwellSecs,
 		patrolChannelsFile: patrolChannelsFile,
 	}
 }
@@ -99,18 +108,71 @@ func (s *Server) SetConfigFns(getFn func() ([]byte, error), saveFn func([]byte) 
 	s.saveConfigFn = saveFn
 }
 
+// SetCfgUpdater は config.json 保存後に時間系設定を Patroller へリアルタイム反映するコールバックを設定する。
+func (s *Server) SetCfgUpdater(fn func(dwellSecs, moveTimeoutSecs, groupDelaySecs float64, parallelLimit int)) {
+	s.cfgUpdaterFn = fn
+}
+
+// NotifyChMovePacket は ncap が [0x2E] パケットを受信したとき main.go から呼ぶ。
+// 巡回中であれば Patroller に移動完了シグナルを転送する。
+func (s *Server) NotifyChMovePacket() {
+	s.patroller.NotifyChMovePacket()
+}
+
+// UpdatePatrollerCfg は Patroller の設定をリアルタイムで更新する。
+// SetCfgUpdater コールバック内から呼ぶ。
+func (s *Server) UpdatePatrollerCfg(cfg mumu.Config) {
+	s.setMumuCfg(cfg)
+	s.patroller.UpdateConfig(cfg)
+}
+
 // OnDetect は検知イベントをGUIのログに追加するコールバック
 func (s *Server) OnDetect(det notifier.Detection) {
 	line := fmt.Sprintf("[%s] %s", det.Time.Format("15:04:05"), notifier.Format(det))
+	detCh := det.LineID // 検知されたチャンネル番号
+
 	s.mu.Lock()
+	// 通常ログに追記
 	s.logLines = append(s.logLines, line)
 	if len(s.logLines) > 200 {
 		s.logLines = s.logLines[len(s.logLines)-200:]
 	}
+	// 金ウリボ履歴に追記（最大50件）
+	event := GoldBoarEvent{
+		Time:     det.Time.Format("01/02 15:04:05"),
+		Channel:  detCh,
+		Location: notifier.Format(det),
+	}
+	s.goldBoarHistory = append(s.goldBoarHistory, event)
+	if len(s.goldBoarHistory) > 50 {
+		s.goldBoarHistory = s.goldBoarHistory[len(s.goldBoarHistory)-50:]
+	}
+	// 巡回チャンネルリストから該当chを削除
+	newChs := make([]uint32, 0, len(s.patrolChannels))
+	removed := false
+	for _, pc := range s.patrolChannels {
+		if pc == detCh {
+			removed = true
+			continue
+		}
+		newChs = append(newChs, pc)
+	}
+	if removed {
+		s.patrolChannels = newChs
+		log.Printf("[GUI] 金ウリボ検知: Ch%d を巡回リストから削除 (残%d ch)", detCh, len(newChs))
+	}
+	saveChannelsFn := s.saveChannelsFn
 	clients := make([]chan string, len(s.clients))
 	copy(clients, s.clients)
 	s.mu.Unlock()
 
+	// ファイルに保存（ロック外）
+	if removed && saveChannelsFn != nil {
+		if err := saveChannelsFn(newChs); err != nil {
+			log.Printf("[GUI] channels.txt 保存失敗: %v", err)
+		}
+	}
+	// SSEで全クライアントに通知
 	for _, ch := range clients {
 		select {
 		case ch <- line:
@@ -163,6 +225,10 @@ func (w *guiWriter) Write(p []byte) (int, error) {
 		w.buf = w.buf[idx+1:]
 		if line != "" {
 			w.srv.AddLog(line)
+			// [0x2E] パケットログを検知して巡回の移動完了シグナルを送る
+			if strings.Contains(line, "[0x2E]") {
+				w.srv.patroller.NotifyChMovePacket()
+			}
 		}
 	}
 	return n, err
@@ -187,6 +253,7 @@ func (s *Server) startHTTP(ctx context.Context) (string, error) {
 	mux.HandleFunc("/api/patrol/channels", s.handlePatrolChannels)
 	mux.HandleFunc("/api/test-detect", s.handleTestDetect)
 	mux.HandleFunc("/api/config", s.handleConfig)
+	mux.HandleFunc("/api/gold-history", s.handleGoldHistory)
 	mux.HandleFunc("/events", s.handleSSE)
 
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
@@ -456,9 +523,22 @@ func (s *Server) handlePatrolChannels(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"channels":   s.patrolChannels,
-		"dwell_secs": s.patrolDwellSecs,
+		"channels": s.patrolChannels,
 	})
+}
+
+// handleGoldHistory は金ウリボ検知履歴を返す
+func (s *Server) handleGoldHistory(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	h := make([]GoldBoarEvent, len(s.goldBoarHistory))
+	copy(h, s.goldBoarHistory)
+	s.mu.RUnlock()
+	// 新しい順に返す
+	for i, j := 0, len(h)-1; i < j; i, j = i+1, j-1 {
+		h[i], h[j] = h[j], h[i]
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(h)
 }
 
 // handleConfig は config.json の読み込み（GET）または保存（POST）を行う。
@@ -480,6 +560,38 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("[GUI] config.json を保存しました")
+
+		// 時間系設定をPatrollerにリアルタイム反映
+		if s.cfgUpdaterFn != nil {
+			var raw map[string]json.RawMessage
+			if json.Unmarshal(buf, &raw) == nil {
+				getF64 := func(key string, def float64) float64 {
+					if v, ok := raw[key]; ok {
+						var f float64
+						if json.Unmarshal(v, &f) == nil {
+							return f
+						}
+					}
+					return def
+				}
+				getInt := func(key string, def int) int {
+					if v, ok := raw[key]; ok {
+						var i int
+						if json.Unmarshal(v, &i) == nil {
+							return i
+						}
+					}
+					return def
+				}
+				dwellSecs       := getF64("patrol_dwell_secs", 60)
+				moveTimeoutSecs := getF64("patrol_move_timeout_secs", 30)
+				groupDelaySecs  := getF64("parallel_group_delay_secs", 0)
+				parallelLimit   := getInt("parallel_limit", 0)
+				s.cfgUpdaterFn(dwellSecs, moveTimeoutSecs, groupDelaySecs, parallelLimit)
+				log.Printf("[GUI] 巡回設定を即時反映: 滞在=%.0fs, タイムアウト=%.0fs, グループ間=%.0fs, 並列=%d",
+					dwellSecs, moveTimeoutSecs, groupDelaySecs, parallelLimit)
+			}
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
@@ -507,7 +619,6 @@ func (s *Server) handlePatrolStart(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Serials      []string `json:"serials"`
 		Channels     []uint32 `json:"channels"`
-		DwellSecs    float64  `json:"dwell_secs"`
 		Reversed     bool     `json:"reversed"`
 		LoopMode     bool     `json:"loop_mode"`
 		StartChannel uint32   `json:"start_channel"`
@@ -520,16 +631,12 @@ func (s *Server) handlePatrolStart(w http.ResponseWriter, r *http.Request) {
 	if len(channels) == 0 {
 		channels = s.patrolChannels
 	}
-	dwell := req.DwellSecs
-	if dwell <= 0 {
-		dwell = s.patrolDwellSecs
-	}
 	opts := mumu.PatrolOptions{
 		Reversed:     req.Reversed,
 		LoopMode:     req.LoopMode,
 		StartChannel: req.StartChannel,
 	}
-	s.patroller.Start(req.Serials, channels, dwell, s.patrolChannelsFile, opts)
+	s.patroller.Start(req.Serials, channels, s.patrolChannelsFile, opts)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
 }
@@ -619,557 +726,478 @@ const indexHTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LoyalBoarlet Monitor</title>
 <style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #eaeaea; min-height: 100vh; padding: 16px; }
-h1 { color: #e94560; font-size: 1.4em; margin-bottom: 16px; }
-h2 { color: #eaeaea; background: #0f3460; padding: 8px 12px; border-radius: 6px 6px 0 0; font-size: 0.95em; }
-.card { background: #16213e; border-radius: 8px; margin-bottom: 16px; overflow: hidden; }
-.card-body { padding: 12px; }
-label { color: #a0a0b0; font-size: 0.85em; }
-input[type=number], input[type=text] {
-  background: #0f3460; color: #eaeaea; border: 1px solid #e94560;
-  border-radius: 4px; padding: 5px 8px; width: 80px; font-size: 0.9em;
-}
-input[type=text].wide { width: 100%; }
-button {
-  background: #e94560; color: #fff; border: none; border-radius: 4px;
-  padding: 6px 14px; cursor: pointer; font-size: 0.9em; transition: background .2s;
-}
-button:hover { background: #c73652; }
-button:disabled { background: #555; cursor: default; }
-button.secondary { background: #0f3460; }
-button.secondary:hover { background: #1a4a80; }
-button.green { background: #2e7d32; }
-button.green:hover { background: #388e3c; }
-.flex-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
-.flex-row:last-child { margin-bottom: 0; }
-.device-list { display: flex; flex-direction: column; gap: 6px; }
-.device-row { display: flex; gap: 8px; align-items: center; background: #0f3460; border-radius: 6px; padding: 8px 12px; flex-wrap: wrap; }
-.serial { color: #7ec8e3; font-family: monospace; font-size: 0.9em; flex: 1; min-width: 160px; }
-.log-box {
-  background: #0d0d1a; font-family: monospace; font-size: 0.8em;
-  height: 260px; overflow-y: auto; padding: 8px; border-radius: 0 0 8px 8px;
-  border: 1px solid #0f3460;
-}
-.log-line { color: #b0b0c0; padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
-.log-line.detect { color: #ffd700; font-weight: bold; }
-.no-devices { color: #606080; font-size: 0.85em; padding: 4px 0; }
-#status-bar { color: #4caf50; font-size: 0.82em; }
-.patrol-status { background: #0d1b33; border-radius: 6px; padding: 8px 12px; font-size: 0.85em; margin-bottom: 8px; }
-.patrol-status span { margin-right: 16px; }
-.patrol-status .running { color: #4caf50; font-weight: bold; }
-.patrol-status .stopped { color: #888; }
-.ch-list { background: #0d0d1a; border-radius: 4px; padding: 8px; font-family: monospace; font-size: 0.78em; color: #7ec8e3; max-height: 60px; overflow-y: auto; word-break: break-all; margin-bottom: 4px; }
-input[type=checkbox] { accent-color: #e94560; width: 16px; height: 16px; }
-.check-label { display: flex; align-items: center; gap: 6px; cursor: pointer; color: #eaeaea; }
-.cfg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 20px; }
-@media(max-width:640px){ .cfg-grid { grid-template-columns: 1fr; } }
-.cfg-field { display: flex; flex-direction: column; gap: 3px; }
-.cfg-field label { color: #a0a0b0; font-size: 0.82em; }
-.cfg-field input[type=text], .cfg-field input[type=number], .cfg-field textarea {
-  width: 100%; background: #0f3460; color: #eaeaea; border: 1px solid #334466;
-  border-radius: 4px; padding: 5px 8px; font-size: 0.88em; box-sizing: border-box;
-}
-.cfg-field textarea { min-height: 56px; resize: vertical; font-family: monospace; }
-.cfg-save-bar { display:flex; gap:8px; align-items:center; margin-top:10px; }
-.cfg-note { font-size:0.75em; color:#606080; margin-top:4px; }
-.ch-editor { display:flex; flex-direction:column; gap:4px; max-height:180px; overflow-y:auto; margin-bottom:6px; }
-.ch-row { display:flex; gap:6px; align-items:center; background:#0d0d1a; border-radius:4px; padding:4px 8px; }
-.ch-row input[type=number] { width:80px; border-color:#334466; }
-.ch-row .ch-num { color:#7ec8e3; font-family:monospace; font-size:0.9em; min-width:24px; text-align:right; }
-.toggle-btn { padding:5px 12px; font-size:0.85em; }
-.toggle-btn.active { background:#1565c0; }
-.toggle-btn.active:hover { background:#1976d2; }
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0a1a;color:#eaeaea;font-family:'Segoe UI',sans-serif;font-size:14px;height:100vh;width:100vw;overflow:hidden;user-select:none;display:flex;flex-direction:column}
+h1{font-size:1.1em;padding:6px 12px;background:#0d1b33;border-bottom:1px solid #1a3a6a;display:flex;align-items:center;gap:8px;height:36px;flex-shrink:0}
+button{background:#1a3a6a;color:#eaeaea;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:0.88em;transition:background .15s}
+button:hover{background:#2a5aa0}
+button:disabled{opacity:.4;cursor:default}
+button.green{background:#1b5e20}
+button.green:hover{background:#2e7d32}
+button.secondary{background:#1a2a3a}
+button.secondary:hover{background:#2a3a4a}
+button.toggle-btn{padding:5px 12px;font-size:0.85em}
+button.toggle-btn.active{background:#1565c0}
+button.toggle-btn.active:hover{background:#1976d2}
+input[type=text],input[type=number],textarea,select{background:#0f3460;color:#eaeaea;border:1px solid #334466;border-radius:4px;padding:5px 8px;font-size:0.88em}
+input[type=checkbox]{accent-color:#e94560;width:16px;height:16px}
+.flex-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+/* ─── Layout ─── */
+#workspace{display:flex;flex-direction:row;flex:1;overflow:hidden;min-height:0;width:100%}
+.panel-col{display:flex;flex-direction:column;overflow:hidden;min-width:200px;min-height:0}
+.splitter-h{width:5px;background:#1a3a6a;cursor:col-resize;flex-shrink:0}
+.splitter-h:hover,.splitter-h.active{background:#2a7ae0}
+/* ─── Panel ─── */
+.panel{display:flex;flex-direction:column;background:#0d1b33;border:1px solid #1a3a6a;border-radius:6px;margin:3px;overflow:hidden;transition:flex .15s}
+.panel.minimized{flex:none!important}
+.panel-header{display:flex;align-items:center;gap:6px;padding:5px 10px;background:#111e38;border-bottom:1px solid #1a3a6a;cursor:grab;flex-shrink:0;height:32px;border-radius:5px 5px 0 0}
+.panel-header:active{cursor:grabbing}
+.panel.minimized .panel-header{border-bottom:none;border-radius:5px}
+.panel-title{font-size:0.85em;font-weight:bold;flex:1;pointer-events:none;white-space:nowrap}
+.panel-btn{background:none;border:none;color:#aaa;cursor:pointer;padding:2px 6px;font-size:1em;border-radius:3px;line-height:1}
+.panel-btn:hover{background:#2a3a5a;color:#fff}
+.panel-body{flex:1;overflow-y:auto;padding:10px;min-height:0}
+.panel.minimized .panel-body{display:none!important}
+/* Drop indicator */
+.drop-indicator{display:none;position:fixed;background:rgba(42,122,224,.3);border:2px dashed #2a7ae0;border-radius:4px;pointer-events:none;z-index:999}
+.drop-indicator.visible{display:block}
+/* Content */
+.device-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+.device-entry{background:#0d0d1a;border-radius:6px;padding:8px 10px}
+.device-entry .serial{color:#7ec8e3;font-family:monospace;font-size:0.85em}
+.device-entry .uid{color:#a0a0b0;font-size:0.8em}
+.device-entry.matched .uid{color:#ffd700}
+.no-devices{color:#606080;font-size:0.85em;padding:4px 0}
+.log-area{flex:1;background:#0a0a14;overflow-y:auto;padding:8px;font-family:monospace;font-size:0.8em;min-height:0}
+.log-line{color:#b0b0c0;padding:1px 0;white-space:pre-wrap;word-break:break-all}
+.log-line.detect{color:#ffd700;font-weight:bold}
+#status-bar{color:#4caf50;font-size:0.82em}
+.patrol-status{background:#090f20;border-radius:4px;padding:6px 10px;font-size:0.82em;margin-bottom:6px}
+.patrol-status span{margin-right:12px}
+.patrol-status .running{color:#4caf50;font-weight:bold}
+.patrol-status .stopped{color:#888}
+.ch-editor{display:flex;flex-direction:column;gap:4px;max-height:150px;overflow-y:auto;margin-bottom:6px}
+.ch-row{display:flex;gap:6px;align-items:center;background:#0d0d1a;border-radius:4px;padding:4px 8px}
+.ch-row .ch-num{color:#7ec8e3;font-family:monospace;font-size:0.9em;min-width:24px;text-align:right}
+.cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 20px}
+.cfg-field{display:flex;flex-direction:column;gap:3px}
+.cfg-field label{color:#a0a0b0;font-size:0.82em}
+.cfg-field input{width:100%}
+.cfg-save-bar{display:flex;gap:8px;align-items:center;margin-top:10px}
+.cfg-note{font-size:0.75em;color:#606080;margin-top:4px}
+.check-label{display:flex;align-items:center;gap:6px;cursor:pointer;color:#eaeaea}
+.section-title{font-size:0.8em;color:#7ec8e3;font-weight:bold;margin:10px 0 4px;border-bottom:1px solid #1a3a6a;padding-bottom:3px}
+.gold-table{width:100%;border-collapse:collapse;font-size:0.82em}
+.gold-table th{color:#ffd700;text-align:left;padding:3px 8px;border-bottom:1px solid #1a3a6a;white-space:nowrap}
+.gold-table td{padding:4px 8px;border-bottom:1px solid #0d1530;vertical-align:top}
+.gold-table tr:hover td{background:#0d1b33}
+.gold-table .ch-cell{color:#7ec8e3;font-family:monospace;font-weight:bold;white-space:nowrap}
+.gold-table .time-cell{color:#a0a0b0;white-space:nowrap;font-size:0.85em}
+.no-history{color:#606080;font-size:0.85em;padding:8px 0}
 </style>
 </head>
 <body>
 <h1>🐗 LoyalBoarlet Monitor</h1>
-
-<!-- デバイス一覧 & 手動切替 -->
-<div class="card">
-  <h2>📱 デバイス一覧 &amp; 手動切替</h2>
-  <div class="card-body">
-    <div class="flex-row">
-      <button onclick="refreshDevices()">🔄 デバイス再取得</button>
-      <label>一括切替 Ch:</label>
-      <input type="number" id="allch" min="1" max="999" value="1">
-      <button onclick="switchAll()">▶ 全切替</button>
-      <span id="status-bar"></span>
-    </div>
-    <div class="device-list" id="device-list"><div class="no-devices">読み込み中...</div></div>
-  </div>
-</div>
-
-<!-- チャンネル巡回 -->
-<div class="card">
-  <h2>🔁 チャンネル巡回</h2>
-  <div class="card-body">
-    <div class="patrol-status" id="patrol-status">
-      <span class="stopped" id="ps-state">■ 停止中</span>
-      <span id="ps-ch"></span>
-      <span id="ps-prog"></span>
-      <span id="ps-parallel"></span>
-    </div>
-
-    <!-- 巡回オプション -->
-    <div class="flex-row" style="margin-bottom:8px">
-      <label>滞在(秒):</label>
-      <input type="number" id="patrol-dwell" min="1" max="3600" value="30" style="width:70px">
-      <label>開始Ch:</label>
-      <input type="number" id="patrol-start-ch" min="0" max="9999" value="0" style="width:70px" title="0=前回位置から再開">
-      <button class="secondary toggle-btn" id="btn-reversed" onclick="toggleReversed()" title="巡回方向を切り替え">⬆ 正順</button>
-      <button class="secondary toggle-btn" id="btn-loop" onclick="toggleLoop()" title="ループ/一巡モード切替">🔁 ループ</button>
-    </div>
-    <div class="flex-row">
-      <button class="green" id="btn-patrol-start" onclick="patrolStart()">▶ 巡回開始</button>
-      <button class="secondary" id="btn-patrol-stop" onclick="patrolStop()" disabled>■ 停止</button>
-    </div>
-
-    <!-- チャンネルリスト編集 -->
-    <div style="margin:10px 0 6px">
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
-        <label>巡回チャンネル:</label>
-        <button class="secondary" style="padding:3px 8px;font-size:0.8em" onclick="addChannel()">＋ 追加</button>
-        <button class="secondary" style="padding:3px 8px;font-size:0.8em" onclick="sortChannels('asc')">↑ 昇順</button>
-        <button class="secondary" style="padding:3px 8px;font-size:0.8em" onclick="sortChannels('desc')">↓ 降順</button>
-        <button class="secondary" style="padding:3px 8px;font-size:0.8em" id="btn-ch-save" onclick="saveChannels()" disabled>💾 ファイルに保存</button>
-        <span id="ch-save-status" style="font-size:0.8em;color:#a0a0b0"></span>
+<div id="workspace">
+  <!-- 左カラム -->
+  <div class="panel-col" id="col-left" style="flex:1.3">
+    <div class="panel" id="panel-devices">
+      <div class="panel-header" draggable="true" data-panel="panel-devices">
+        <span class="panel-title">📱 デバイス一覧 &amp; 手動切替</span>
+        <button class="panel-btn" onclick="minimizePanel('panel-devices')" title="最小化">─</button>
       </div>
-      <div class="ch-editor" id="ch-editor"><div class="no-devices">読み込み中...</div></div>
-      <div style="display:flex;gap:6px;align-items:center;margin-top:6px">
-        <input type="text" id="ch-bulk-input" placeholder="例: 6,13,23,35,41..." style="flex:1;width:auto;border-color:#334466;font-size:0.85em">
-        <button class="secondary" style="padding:3px 10px;font-size:0.8em;white-space:nowrap" onclick="bulkImportChannels()">上書き</button>
+      <div class="panel-body">
+        <div class="flex-row">
+          <button onclick="refreshDevices()">🔄 再取得</button>
+          <label>一括 Ch:</label>
+          <input type="number" id="allch" min="1" max="999" value="1" style="width:65px">
+          <button onclick="switchAll()">▶ 全切替</button>
+          <span id="status-bar"></span>
+        </div>
+        <div class="device-list" id="device-list"><div class="no-devices">読み込み中...</div></div>
       </div>
     </div>
-
-    <!-- 巡回対象デバイス -->
-    <div>
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
-        <label>巡回対象デバイス:</label>
-        <button class="secondary" style="padding:3px 8px;font-size:0.8em" onclick="refreshDevices()">🔄 再取得</button>
-        <button class="secondary" style="padding:3px 8px;font-size:0.8em" onclick="selectAllDevices(true)">全選択</button>
-        <button class="secondary" style="padding:3px 8px;font-size:0.8em" onclick="selectAllDevices(false)">全解除</button>
+    <div class="panel" id="panel-patrol" style="flex:2">
+      <div class="panel-header" draggable="true" data-panel="panel-patrol">
+        <span class="panel-title">🔁 チャンネル巡回</span>
+        <button class="panel-btn" onclick="minimizePanel('panel-patrol')" title="最小化">─</button>
       </div>
-      <div id="patrol-devices" class="device-list"><div class="no-devices">デバイス更新ボタンで取得</div></div>
+      <div class="panel-body">
+        <div class="patrol-status">
+          <span class="stopped" id="ps-state">■ 停止中</span>
+          <span id="ps-ch"></span>
+          <span id="ps-prog"></span>
+          <span id="ps-parallel"></span>
+        </div>
+        <div id="ps-full" style="font-size:0.78em;color:#e57373;min-height:1em;margin-bottom:6px"></div>
+        <div class="flex-row" style="margin-bottom:8px">
+          <label>開始Ch:</label>
+          <input type="number" id="patrol-start-ch" min="0" max="9999" value="0" style="width:65px" title="0=前回位置から再開">
+          <button class="secondary toggle-btn" id="btn-reversed" onclick="toggleReversed()">⬆ 正順</button>
+          <button class="secondary toggle-btn" id="btn-loop" onclick="toggleLoop()">🔁 ループ</button>
+        </div>
+        <div class="flex-row" style="margin-bottom:8px">
+          <button class="green" id="btn-patrol-start" onclick="patrolStart()">▶ 巡回開始</button>
+          <button class="secondary" id="btn-patrol-stop" onclick="patrolStop()" disabled>■ 停止</button>
+        </div>
+        <div class="section-title">巡回チャンネル</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+          <button class="secondary" style="padding:3px 8px;font-size:0.8em" onclick="addChannel()">＋ 追加</button>
+          <button class="secondary" style="padding:3px 8px;font-size:0.8em" onclick="sortChannels('asc')">↑ 昇順</button>
+          <button class="secondary" style="padding:3px 8px;font-size:0.8em" onclick="sortChannels('desc')">↓ 降順</button>
+          <button class="secondary" style="padding:3px 8px;font-size:0.8em" id="btn-ch-save" onclick="saveChannels()" disabled>💾 保存</button>
+          <span id="ch-save-status" style="font-size:0.8em;color:#a0a0b0"></span>
+        </div>
+        <div class="ch-editor" id="ch-editor"><div class="no-devices">読み込み中...</div></div>
+        <div style="display:flex;gap:6px;align-items:center;margin-top:6px">
+          <input type="text" id="ch-bulk-input" placeholder="例: 6,13,23,35,41..." style="flex:1;width:auto;font-size:0.85em">
+          <button class="secondary" style="padding:3px 10px;font-size:0.8em;white-space:nowrap" onclick="bulkImportChannels()">上書き</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="splitter-h" id="splitter-main"></div>
+
+  <!-- 右カラム -->
+  <div class="panel-col" id="col-right" style="flex:1">
+    <div class="panel" id="panel-gold">
+      <div class="panel-header" draggable="true" data-panel="panel-gold">
+        <span class="panel-title">🌟 金ウリボ検知履歴</span>
+        <button class="panel-btn" onclick="minimizePanel('panel-gold')" title="最小化">─</button>
+      </div>
+      <div class="panel-body">
+        <div id="gold-history-container"><div class="no-history">検知履歴なし</div></div>
+      </div>
+    </div>
+    <div class="panel" id="panel-log" style="flex:2">
+      <div class="panel-header" draggable="true" data-panel="panel-log">
+        <span class="panel-title">📋 検知ログ</span>
+        <button class="panel-btn" onclick="minimizePanel('panel-log')" title="最小化">─</button>
+      </div>
+      <div class="panel-body" style="padding:0;display:flex;flex-direction:column">
+        <div class="log-area" id="log-area"></div>
+        <div style="padding:6px 10px;border-top:1px solid #1a3a6a;display:flex;gap:8px;flex-shrink:0">
+          <button class="secondary" style="font-size:0.8em;padding:3px 10px" onclick="document.getElementById('log-area').innerHTML=''">クリア</button>
+          <button style="font-size:0.8em;padding:3px 10px" onclick="testDetect()">🔔 テスト通知</button>
+        </div>
+      </div>
+    </div>
+    <div class="panel" id="panel-config">
+      <div class="panel-header" draggable="true" data-panel="panel-config">
+        <span class="panel-title">⚙ 設定</span>
+        <button class="panel-btn" onclick="minimizePanel('panel-config')" title="最小化">─</button>
+      </div>
+      <div class="panel-body">
+        <div id="cfg-form" class="cfg-grid"></div>
+        <div class="cfg-save-bar">
+          <button onclick="saveConfig()">💾 保存</button>
+          <span id="cfg-status" style="font-size:0.82em;color:#a0a0b0"></span>
+        </div>
+        <p class="cfg-note">* 滞在時間・タイムアウト・並列設定は保存後すぐ反映されます。その他は再起動が必要です。</p>
+      </div>
     </div>
   </div>
 </div>
-
-<!-- 設定 -->
-<div class="card">
-  <h2>⚙️ 設定 (config.json)</h2>
-  <div class="card-body">
-    <div class="cfg-grid" id="cfg-grid"><div style="color:#606080;font-size:0.85em">読み込み中...</div></div>
-    <div class="cfg-save-bar">
-      <button class="green" onclick="saveConfig()">💾 保存 (config.json)</button>
-      <span id="cfg-status" style="font-size:0.85em;color:#a0a0b0"></span>
-    </div>
-    <div class="cfg-note">※ すべての設定はアプリ再起動後に反映されます。</div>
-  </div>
-</div>
-
-<!-- テスト通知 -->
-<div class="card">
-  <h2>🧪 テスト</h2>
-  <div class="card-body">
-    <div class="flex-row">
-      <button class="secondary" onclick="testDetect()">🐗 ゴールドウリボ通知テスト</button>
-      <span id="test-status" style="font-size:0.85em;color:#a0a0b0"></span>
-    </div>
-    <div style="font-size:0.78em;color:#606080;margin-top:4px">プレイヤーの現在位置・Chをゴールドウリボ出現として Discord/GSheets に送信します</div>
-  </div>
-</div>
-
-<!-- 検知ログ -->
-<div class="card">
-  <h2>📋 検知ログ</h2>
-  <div class="log-box" id="log-box"></div>
-</div>
+<div class="drop-indicator" id="drop-indicator"></div>
 
 <script>
-const logBox = document.getElementById('log-box');
-const statusBar = document.getElementById('status-bar');
-let allDeviceSerials = [];
-let patrolChannels = [];
-
-function appendLog(text) {
-  const d = document.createElement('div');
-  d.className = 'log-line' + (text.includes('DETECTION') || text.includes('検知') ? ' detect' : '');
-  d.textContent = text;
-  logBox.appendChild(d);
-  while (logBox.children.length > 300) logBox.removeChild(logBox.firstChild);
-  logBox.scrollTop = logBox.scrollHeight;
+// ── Minimize ──
+function minimizePanel(id) {
+  const p = document.getElementById(id);
+  const btn = p.querySelector('.panel-btn');
+  if (p.classList.toggle('minimized')) { btn.textContent='＋'; btn.title='展開'; }
+  else { btn.textContent='─'; btn.title='最小化'; }
 }
 
-fetch('/api/logs').then(r=>r.json()).then(d=>{ (d.logs||[]).forEach(appendLog); });
-
-const es = new EventSource('/events');
-es.onmessage = e => appendLog(e.data.replace(/\\n/g, '\n'));
-es.onerror = () => appendLog('[SSE] 接続切断 - 再接続中...');
-
-// ── デバイス ──
-async function refreshDevices() {
-  document.getElementById('device-list').innerHTML = '<div class="no-devices">読み込み中...</div>';
-  document.getElementById('patrol-devices').innerHTML = '<div class="no-devices">読み込み中...</div>';
-  let d;
-  try {
-    const r = await fetch('/api/device-map');
-    if (!r.ok) {
-      const msg = await r.text();
-      appendLog('[GUI] デバイス取得エラー: ' + msg);
-      document.getElementById('device-list').innerHTML = '<div class="no-devices">❌ 取得失敗: ' + msg + '</div>';
-      document.getElementById('patrol-devices').innerHTML = '<div class="no-devices">❌ 取得失敗</div>';
-      return;
-    }
-    d = await r.json();
-  } catch(e) {
-    appendLog('[GUI] デバイス取得失敗: ' + e);
-    document.getElementById('device-list').innerHTML = '<div class="no-devices">❌ 通信エラー: ' + e + '</div>';
-    document.getElementById('patrol-devices').innerHTML = '<div class="no-devices">❌ 通信エラー</div>';
-    return;
-  }
-  const entries = d.devices || [];
-  allDeviceSerials = entries.map(e => e.serial);
-
-  const list = document.getElementById('device-list');
-  const patrolList = document.getElementById('patrol-devices');
-  if (entries.length === 0) {
-    list.innerHTML = '<div class="no-devices">ADBデバイスが見つかりません</div>';
-    patrolList.innerHTML = '<div class="no-devices">ADBデバイスが見つかりません</div>';
-    return;
-  }
-  list.innerHTML = entries.map(e => ` + "`" + `
-    <div class="device-row">
-      <div style="flex:1;min-width:160px">
-        <span class="serial">${e.serial}</span>
-        ${e.device_ip ? ` + "`" + `<span style="color:#606080;font-size:0.78em;margin-left:6px">${e.device_ip}</span>` + "`" + ` : ''}
-      </div>
-      ${e.user_uid ? ` + "`" + `<span style="color:#4caf50;font-size:0.82em;margin-right:4px">UID:${e.user_uid}</span>` + "`" + ` : '<span style="color:#606080;font-size:0.82em;margin-right:4px">未接続</span>'}
-      <label>Ch:</label>
-      <input type="number" id="ch_${CSS.escape(e.serial)}" min="1" max="999" value="1" style="width:70px">
-      <button onclick="switchOne('${e.serial}')">切替</button>
-    </div>` + "`" + `).join('');
-
-  patrolList.innerHTML = entries.map(e => ` + "`" + `
-    <div class="device-row">
-      <label class="check-label">
-        <input type="checkbox" id="pch_${CSS.escape(e.serial)}" checked>
-        <span class="serial">${e.serial}</span>
-        ${e.user_uid ? ` + "`" + `<span style="color:#4caf50;font-size:0.78em;margin-left:4px">UID:${e.user_uid}</span>` + "`" + ` : ''}
-      </label>
-    </div>` + "`" + `).join('');
-}
-
-function selectAllDevices(checked) {
-  allDeviceSerials.forEach(s => {
-    const el = document.getElementById('pch_' + CSS.escape(s));
-    if (el) el.checked = checked;
+// ── Splitter ──
+(function(){
+  const sp = document.getElementById('splitter-main');
+  const L = document.getElementById('col-left');
+  const R = document.getElementById('col-right');
+  let drag=false,sx=0,slw=0,srw=0;
+  sp.addEventListener('mousedown', e=>{
+    drag=true; sx=e.clientX;
+    slw=L.getBoundingClientRect().width;
+    srw=R.getBoundingClientRect().width;
+    sp.classList.add('active');
+    document.body.style.cursor='col-resize';
+    e.preventDefault();
   });
-}
-
-function selectedSerials() {
-  return allDeviceSerials.filter(s => {
-    const el = document.getElementById('pch_' + CSS.escape(s));
-    return el && el.checked;
+  document.addEventListener('mousemove', e=>{
+    if(!drag) return;
+    const dx=e.clientX-sx, total=slw+srw;
+    const nl=Math.max(180,Math.min(total-180,slw+dx));
+    const nr=total-nl;
+    const ratio=nl/total;
+    L.style.flex=ratio+' 1 0';
+    R.style.flex=(1-ratio)+' 1 0';
+    L.style.width=''; R.style.width='';
   });
-}
-
-async function switchOne(serial) {
-  const ch = parseInt(document.getElementById('ch_' + CSS.escape(serial)).value);
-  if (!ch || ch < 1) { alert('チャンネル番号を入力してください'); return; }
-  setStatus('切替中...');
-  const r = await fetch('/api/switch', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({serial, channel: ch})
+  document.addEventListener('mouseup', ()=>{
+    if(!drag) return;
+    drag=false; sp.classList.remove('active');
+    document.body.style.cursor='';
   });
-  const d = await r.json();
-  const res = (d.results||[])[0];
-  setStatus(res && res.ok ? '✅ ' + serial + ' → Ch' + ch : '❌ ' + (res && res.error || '不明'));
-}
+})();
 
-async function switchAll() {
-  const ch = parseInt(document.getElementById('allch').value);
-  if (!ch || ch < 1) { alert('チャンネル番号を入力してください'); return; }
-  setStatus('全切替中...');
-  const r = await fetch('/api/switch', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({all: true, channel: ch})
+// ── Drag & Drop panels ──
+let dragPanel=null;
+const dropInd=document.getElementById('drop-indicator');
+document.querySelectorAll('.panel-header[draggable]').forEach(h=>{
+  h.addEventListener('dragstart', e=>{
+    dragPanel=document.getElementById(h.dataset.panel);
+    e.dataTransfer.effectAllowed='move';
+    e.dataTransfer.setData('text/plain',h.dataset.panel);
+    setTimeout(()=>{ if(dragPanel) dragPanel.style.opacity='0.4'; },0);
   });
-  const d = await r.json();
-  const results = d.results || [];
-  const ok = results.filter(r=>r.ok).length;
-  const ng = results.filter(r=>!r.ok).length;
-  setStatus('✅ ' + ok + '台成功' + (ng ? ' / ❌ ' + ng + '台失敗' : '') + ' → Ch' + ch);
-}
-
-// ── 巡回 ──
-let patrolReversed = false;
-let patrolLoopMode = true;
-
-function toggleReversed() {
-  patrolReversed = !patrolReversed;
-  const btn = document.getElementById('btn-reversed');
-  btn.textContent = patrolReversed ? '⬇ 逆順' : '⬆ 正順';
-  btn.classList.toggle('active', patrolReversed);
-}
-
-function toggleLoop() {
-  patrolLoopMode = !patrolLoopMode;
-  const btn = document.getElementById('btn-loop');
-  btn.textContent = patrolLoopMode ? '🔁 ループ' : '1️⃣ 一巡';
-  btn.classList.toggle('active', !patrolLoopMode);
-}
-
-async function loadPatrolChannels() {
-  const r = await fetch('/api/patrol/channels');
-  const d = await r.json();
-  patrolChannels = d.channels || [];
-  if (d.dwell_secs > 0) document.getElementById('patrol-dwell').value = d.dwell_secs;
-  renderChannelEditor();
-}
-
-function renderChannelEditor() {
-  const editor = document.getElementById('ch-editor');
-  if (patrolChannels.length === 0) {
-    editor.innerHTML = '<div class="no-devices">(チャンネル未設定)</div>';
-    return;
-  }
-  editor.innerHTML = patrolChannels.map((ch, i) => '<div class="ch-row">'
-    + '<span class="ch-num">' + (i+1) + '</span>'
-    + '<input type="number" min="1" max="9999" value="' + ch + '" onchange="editChannelValue(' + i + ', this.value)" style="width:80px">'
-    + '<button class="secondary" style="padding:2px 8px;font-size:0.8em" onclick="removeChannel(' + i + ')">✕</button>'
-    + '</div>'
-  ).join('');
-}
-
-function markChannelsChanged() {
-  document.getElementById('btn-ch-save').disabled = false;
-  document.getElementById('ch-save-status').textContent = '未保存';
-}
-
-function editChannelValue(idx, val) {
-  const n = parseInt(val);
-  if (n > 0) {
-    patrolChannels[idx] = n;
-    markChannelsChanged();
-  }
-}
-
-function addChannel() {
-  const val = prompt('追加するチャンネル番号:', '');
-  if (val === null) return;
-  const n = parseInt(val.trim());
-  if (!n || n < 1) { alert('有効なチャンネル番号を入力してください'); return; }
-  patrolChannels.push(n);
-  renderChannelEditor();
-  markChannelsChanged();
-}
-
-function removeChannel(idx) {
-  patrolChannels.splice(idx, 1);
-  renderChannelEditor();
-  markChannelsChanged();
-}
-
-function sortChannels(order) {
-  if (patrolChannels.length < 2) return;
-  patrolChannels.sort((a, b) => order === 'asc' ? a - b : b - a);
-  renderChannelEditor();
-  markChannelsChanged();
-}
-
-function bulkImportChannels() {
-  const raw = document.getElementById('ch-bulk-input').value.trim();
-  if (!raw) return;
-  const parsed = raw.split(/[,\s]+/).map(s => parseInt(s.trim())).filter(n => n > 0);
-  if (parsed.length === 0) { alert('有効なチャンネル番号が見つかりません'); return; }
-  patrolChannels = parsed;
-  document.getElementById('ch-bulk-input').value = '';
-  renderChannelEditor();
-  markChannelsChanged();
-}
-
-async function saveChannels() {
-  const el = document.getElementById('ch-save-status');
-  el.textContent = '保存中...';
-  try {
-    const r = await fetch('/api/patrol/channels', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({channels: patrolChannels})
-    });
-    const d = await r.json();
-    if (d.ok) {
-      el.textContent = '✅ 保存完了';
-      document.getElementById('btn-ch-save').disabled = true;
-      // 保存後に自動リロード
-      await loadPatrolChannels();
-    } else {
-      el.textContent = '❌ 失敗';
-    }
-  } catch(e) {
-    el.textContent = '❌ ' + e;
-  }
-  setTimeout(() => { if(el.textContent.includes('保存完了')) el.textContent = ''; }, 4000);
-}
-
-async function patrolStart() {
-  const serials = selectedSerials();
-  const dwell = parseFloat(document.getElementById('patrol-dwell').value) || 30;
-  const startCh = parseInt(document.getElementById('patrol-start-ch').value) || 0;
-  const r = await fetch('/api/patrol/start', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      serials,
-      channels: patrolChannels,
-      dwell_secs: dwell,
-      reversed: patrolReversed,
-      loop_mode: patrolLoopMode,
-      start_channel: startCh
-    })
+  h.addEventListener('dragend', ()=>{
+    if(dragPanel) dragPanel.style.opacity='';
+    dragPanel=null;
+    dropInd.classList.remove('visible');
   });
-  const d = await r.json();
-  if (d.ok) updatePatrolUI(true);
-}
+});
+document.querySelectorAll('.panel').forEach(p=>{
+  p.addEventListener('dragover', e=>{
+    if(!dragPanel||p===dragPanel) return;
+    e.preventDefault();
+    const r=p.getBoundingClientRect();
+    const before=e.clientY<r.top+r.height/2;
+    dropInd.style.left=r.left+'px'; dropInd.style.width=r.width+'px';
+    dropInd.style.height='3px'; dropInd.style.top=((before?r.top:r.bottom)-2)+'px';
+    dropInd.classList.add('visible');
+    p._dropBefore=before;
+  });
+  p.addEventListener('dragleave',()=>dropInd.classList.remove('visible'));
+  p.addEventListener('drop', e=>{
+    e.preventDefault();
+    dropInd.classList.remove('visible');
+    if(!dragPanel||p===dragPanel) return;
+    p.parentNode.insertBefore(dragPanel, p._dropBefore?p:p.nextSibling);
+  });
+});
+['col-left','col-right'].forEach(id=>{
+  const col=document.getElementById(id);
+  col.addEventListener('dragover', e=>{
+    if(!dragPanel||dragPanel.closest('.panel-col')===col) return;
+    e.preventDefault();
+    const r=col.getBoundingClientRect();
+    dropInd.style.left=r.left+'px'; dropInd.style.width=r.width+'px';
+    dropInd.style.height=r.height+'px'; dropInd.style.top=r.top+'px';
+    dropInd.classList.add('visible');
+  });
+  col.addEventListener('drop', e=>{
+    e.preventDefault();
+    dropInd.classList.remove('visible');
+    if(!dragPanel||dragPanel.closest('.panel-col')===col) return;
+    col.appendChild(dragPanel);
+  });
+});
 
-async function patrolStop() {
-  await fetch('/api/patrol/stop', {method:'POST'});
-  updatePatrolUI(false);
-}
-
-function updatePatrolUI(running) {
-  document.getElementById('btn-patrol-start').disabled = running;
-  document.getElementById('btn-patrol-stop').disabled = !running;
-}
-
-async function pollPatrolStatus() {
-  try {
-    const r = await fetch('/api/patrol/status');
-    const d = await r.json();
-    const stateEl = document.getElementById('ps-state');
-    const chEl = document.getElementById('ps-ch');
-    const progEl = document.getElementById('ps-prog');
-    const parallelEl = document.getElementById('ps-parallel');
-    if (d.running) {
-      const dir = d.reversed ? '⬇' : '⬆';
-      const mode = d.loop_mode ? '🔁' : '1️⃣';
-      stateEl.className = 'running';
-      stateEl.textContent = dir + ' ' + mode + ' 巡回中';
-      chEl.textContent = 'Ch: ' + d.current_channel;
-      progEl.textContent = (d.current_index+1) + ' / ' + d.total_channels;
-      const delayStr = d.parallel_group_delay > 0 ? ' / ディレイ' + d.parallel_group_delay + 's' : '';
-      parallelEl.textContent = '並列: ' + (d.parallel_limit === 0 ? '無制限' : d.parallel_limit + '台' + delayStr);
-      updatePatrolUI(true);
-    } else {
-      stateEl.className = 'stopped';
-      stateEl.textContent = '■ 停止中';
-      chEl.textContent = d.last_channel > 0 ? '前回: Ch' + d.last_channel : '';
-      progEl.textContent = '';
-      parallelEl.textContent = '';
-      updatePatrolUI(false);
-    }
-  } catch(_) {}
-  setTimeout(pollPatrolStatus, 2000);
-}
-
-function setStatus(msg) {
-  statusBar.textContent = msg;
-  setTimeout(()=>{ if(statusBar.textContent===msg) statusBar.textContent=''; }, 5000);
-}
-
-// ── テスト通知 ──
-async function testDetect() {
-  const el = document.getElementById('test-status');
-  el.textContent = '送信中...';
-  try {
-    const r = await fetch('/api/test-detect', {method: 'POST'});
-    const d = await r.json();
-    el.textContent = d.ok ? '✅ 送信しました' : '❌ 失敗: ' + JSON.stringify(d);
-  } catch(e) {
-    el.textContent = '❌ エラー: ' + e;
-  }
-  setTimeout(() => { el.textContent = ''; }, 5000);
-}
-
-// ── 設定 ──
-let currentCfg = {};
-
-const CFG_FIELDS = [
-  {k:'discord_webhook',   label:'Discord Webhook URL', type:'text',   desc:'空にするとDiscord通知無効'},
-  {k:'debounce_seconds',  label:'デバウンス(秒)',       type:'number', desc:'同Ch+場所の重複通知を抑制する秒数'},
-  {k:'chat_exclude',      label:'チャット除外キーワード', type:'csv',   desc:'カンマ区切り。例: いない,終わった'},
-  {k:'patrol_dwell_secs', label:'巡回滞在(秒)',         type:'number', desc:'各Chに滞在する標準秒数'},
-  {k:'parallel_limit',    label:'並列切替上限 (台数)',  type:'number', desc:'0=無制限。複数エミュレータを同時に切り替える最大台数。変更後は再起動が必要'},
-  {k:'parallel_group_delay_ms', label:'グループ間ディレイ (ms)', type:'number', desc:'並列上限>0のとき、次グループ開始前の待機時間(ms)。0=ディレイなし。変更後は再起動が必要'},
-  {k:'adb_path',          label:'ADBパス',             type:'text',   desc:'adb.exeのフルパスまたは「adb」'},
-  {k:'mumu_delay_ms',     label:'ADB間隔(ms)',         type:'number', desc:'各ADBコマンド間の待機時間'},
-  {k:'mumu_tap_x',        label:'タップX座標',         type:'number', desc:'チャンネル入力欄のタップX'},
-  {k:'mumu_tap_y',        label:'タップY座標',         type:'number', desc:'チャンネル入力欄のタップY'},
-  {k:'mumu_clear_length', label:'クリア文字数',         type:'number', desc:'入力前にDELを送る回数'},
-  {k:'mumu_pre_keycode',  label:'プリキーコード',       type:'text',   desc:'タップ前に送るキーコード'},
-];
-
-function renderConfigGrid(cfg) {
-  currentCfg = Object.assign({}, cfg);
-  const grid = document.getElementById('cfg-grid');
-  grid.innerHTML = CFG_FIELDS.map(f => {
-    let val = cfg[f.k];
-    let inputHtml;
-    if (f.type === 'csv') {
-      const csvVal = Array.isArray(val) ? val.join(', ') : (val || '');
-      inputHtml = '<textarea id="cfg_' + f.k + '" rows="2">' + csvVal + '</textarea>';
-    } else if (f.type === 'number') {
-      inputHtml = '<input type="number" id="cfg_' + f.k + '" value="' + (val ?? '') + '" step="any">';
-    } else {
-      inputHtml = '<input type="text" id="cfg_' + f.k + '" value="' + (val ?? '') + '">';
-    }
-    return '<div class="cfg-field"><label>' + f.label + '</label>' + inputHtml + '<span style="font-size:0.72em;color:#555">' + f.desc + '</span></div>';
+// ── Devices ──
+let selectedDevices=new Set();
+function selectedSerials(){ return [...selectedDevices]; }
+async function refreshDevices(){
+  const r=await fetch('/api/devices');
+  const devs=await r.json();
+  const map=await fetch('/api/device-map').then(r=>r.json()).catch(()=>({}));
+  const el=document.getElementById('device-list');
+  if(!devs||devs.length===0){ el.innerHTML='<div class="no-devices">デバイスが見つかりません</div>'; return; }
+  el.innerHTML=devs.map(d=>{
+    const info=map[d]||{};
+    const uid=info.user_uid||'', ch=info.line_id||'', confirmed=info.confirmed||false;
+    const checked=selectedDevices.has(d)?'checked':'';
+    const uidHtml=uid?('<span class="uid">'+(confirmed?'🔗':'')+' UID:'+uid+(ch?' Ch'+ch:'')+'</span>'):'';
+    return '<div class="device-entry'+(confirmed?' matched':'')+'">'
+      +'<label class="check-label">'
+      +'<input type="checkbox" '+checked+' onchange="toggleDevice(\''+d+'\',this.checked)">'
+      +'<span class="serial">'+d+'</span>'+uidHtml
+      +'</label>'
+      +'<div style="display:flex;gap:6px;margin-top:4px">'
+      +'<input type="number" id="ch-'+d+'" min="1" max="999" value="1" style="width:65px">'
+      +'<button style="padding:3px 8px;font-size:0.8em" onclick="switchOne(\''+d+'\')">切替</button>'
+      +'</div></div>';
   }).join('');
 }
-
-async function loadConfig() {
-  try {
-    const r = await fetch('/api/config');
-    const cfg = await r.json();
-    renderConfigGrid(cfg);
-  } catch(e) {
-    document.getElementById('cfg-grid').textContent = '読み込み失敗: ' + e;
-  }
+function toggleDevice(s,c){ c?selectedDevices.add(s):selectedDevices.delete(s); }
+async function switchAll(){
+  const ch=document.getElementById('allch').value;
+  const bar=document.getElementById('status-bar');
+  bar.textContent='切替中...';
+  const r=await fetch('/api/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:parseInt(ch),serials:selectedSerials()})});
+  const d=await r.json();
+  bar.textContent=d.ok?'✓ 完了':'✗ '+(d.error||'失敗');
+  setTimeout(()=>bar.textContent='',3000);
+}
+async function switchOne(serial){
+  const ch=parseInt(document.getElementById('ch-'+serial).value);
+  const bar=document.getElementById('status-bar');
+  bar.textContent='切替中...';
+  const r=await fetch('/api/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch,serial})});
+  const d=await r.json();
+  bar.textContent=d.ok?'✓ 完了':'✗ '+(d.error||'失敗');
+  setTimeout(()=>bar.textContent='',3000);
 }
 
-async function saveConfig() {
-  const el = document.getElementById('cfg-status');
-  const updated = Object.assign({}, currentCfg);
-  CFG_FIELDS.forEach(f => {
-    const inp = document.getElementById('cfg_' + f.k);
-    if (!inp) return;
-    if (f.type === 'number') {
-      const n = parseFloat(inp.value);
-      if (!isNaN(n)) updated[f.k] = n;
-    } else if (f.type === 'csv') {
-      updated[f.k] = inp.value.split(',').map(s=>s.trim()).filter(s=>s);
-    } else {
-      updated[f.k] = inp.value;
+// ── Log / SSE ──
+function appendLog(line){
+  const la=document.getElementById('log-area');
+  const div=document.createElement('div');
+  div.className='log-line'+(line.includes('[DETECTION]')||line.includes('金')?' detect':'');
+  div.textContent=line;
+  la.appendChild(div);
+  la.scrollTop=la.scrollHeight;
+}
+async function testDetect(){ await fetch('/api/test-detect',{method:'POST'}); }
+(function(){
+  const src=new EventSource('/events');
+  src.onmessage=e=>{
+    appendLog(e.data);
+    if(e.data.includes('[GUI] 金ウリボ')||e.data.includes('[DETECTION]')){
+      loadGoldHistory(); loadPatrolChannels();
     }
-  });
-  el.textContent = '保存中...';
-  try {
-    const r = await fetch('/api/config', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(updated)
-    });
-    const d = await r.json();
-    el.textContent = d.ok ? '✅ 保存完了（再起動後に反映）' : '❌ 失敗: ' + JSON.stringify(d);
-    if (d.ok) currentCfg = updated;
-  } catch(e) {
-    el.textContent = '❌ エラー: ' + e;
-  }
-  setTimeout(() => { if(el.textContent.includes('保存完了')) el.textContent = ''; }, 4000);
+  };
+  fetch('/api/logs').then(r=>r.json()).then(lines=>(lines||[]).forEach(appendLog));
+})();
+
+// ── Gold History ──
+async function loadGoldHistory(){
+  try{
+    const h=await fetch('/api/gold-history').then(r=>r.json());
+    const c=document.getElementById('gold-history-container');
+    if(!h||h.length===0){ c.innerHTML='<div class="no-history">検知履歴なし</div>'; return; }
+    c.innerHTML='<table class="gold-table"><thead><tr><th>時刻</th><th>Ch</th><th>場所</th></tr></thead><tbody>'
+      +h.map(e=>'<tr><td class="time-cell">'+e.time+'</td><td class="ch-cell">Ch'+e.channel+'</td><td>'+e.location+'</td></tr>').join('')
+      +'</tbody></table>';
+  }catch(_){}
 }
 
+// ── Patrol ──
+let patrolChannels=[],patrolReversed=false,patrolLoopMode=true;
+async function loadPatrolChannels(){
+  const d=await fetch('/api/patrol/channels').then(r=>r.json());
+  patrolChannels=d.channels||[];
+  renderChannelEditor();
+}
+function renderChannelEditor(){
+  const el=document.getElementById('ch-editor');
+  if(patrolChannels.length===0){ el.innerHTML='<div class="no-devices">チャンネルなし</div>'; document.getElementById('btn-ch-save').disabled=true; return; }
+  el.innerHTML=patrolChannels.map((ch,i)=>
+    '<div class="ch-row">'
+    +'<span class="ch-num">'+(i+1)+'.</span>'
+    +'<input type="number" value="'+ch+'" min="1" max="9999" style="width:75px"'
+    +' onchange="patrolChannels['+i+']=parseInt(this.value)||1;document.getElementById(\'btn-ch-save\').disabled=false">'
+    +'<button class="secondary" style="padding:2px 8px;font-size:0.8em" onclick="removeChannel('+i+')">✕</button>'
+    +'</div>'
+  ).join('');
+  document.getElementById('btn-ch-save').disabled=false;
+}
+function addChannel(){ const v=parseInt(prompt('追加するチャンネル番号:',''))||0; if(v>0){patrolChannels.push(v);renderChannelEditor();} }
+function removeChannel(i){ patrolChannels.splice(i,1); renderChannelEditor(); document.getElementById('btn-ch-save').disabled=false; }
+function sortChannels(dir){ patrolChannels.sort((a,b)=>dir==='asc'?a-b:b-a); renderChannelEditor(); document.getElementById('btn-ch-save').disabled=false; }
+function bulkImportChannels(){
+  const nums=document.getElementById('ch-bulk-input').value.split(/[,\s]+/).map(s=>parseInt(s)).filter(n=>n>0);
+  if(!nums.length) return;
+  patrolChannels=nums; renderChannelEditor(); document.getElementById('ch-bulk-input').value=''; document.getElementById('btn-ch-save').disabled=false;
+}
+async function saveChannels(){
+  const r=await fetch('/api/patrol/channels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channels:patrolChannels})});
+  const d=await r.json();
+  const st=document.getElementById('ch-save-status');
+  st.textContent=d.ok?'✓ 保存済':'✗ 失敗';
+  if(d.ok){document.getElementById('btn-ch-save').disabled=true;loadPatrolChannels();}
+  setTimeout(()=>st.textContent='',3000);
+}
+function toggleReversed(){ patrolReversed=!patrolReversed; const b=document.getElementById('btn-reversed'); b.textContent=patrolReversed?'⬇ 逆順':'⬆ 正順'; b.classList.toggle('active',patrolReversed); }
+function toggleLoop(){ patrolLoopMode=!patrolLoopMode; const b=document.getElementById('btn-loop'); b.textContent=patrolLoopMode?'🔁 ループ':'1️⃣ 一巡'; b.classList.toggle('active',!patrolLoopMode); }
+async function patrolStart(){
+  const r=await fetch('/api/patrol/start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({serials:selectedSerials(),channels:patrolChannels,reversed:patrolReversed,loop_mode:patrolLoopMode,start_channel:parseInt(document.getElementById('patrol-start-ch').value)||0})});
+  const d=await r.json();
+  if(!d.ok) alert('巡回開始失敗: '+(d.error||''));
+}
+async function patrolStop(){ await fetch('/api/patrol/stop',{method:'POST'}); }
+function updatePatrolUI(running){ document.getElementById('btn-patrol-start').disabled=running; document.getElementById('btn-patrol-stop').disabled=!running; }
+async function pollPatrolStatus(){
+  try{
+    const d=await fetch('/api/patrol/status').then(r=>r.json());
+    const stateEl=document.getElementById('ps-state');
+    const chEl=document.getElementById('ps-ch');
+    const progEl=document.getElementById('ps-prog');
+    const parEl=document.getElementById('ps-parallel');
+    if(d.running){
+      stateEl.className='running';
+      stateEl.textContent='▶ 巡回中'+(d.waiting_move?' ⏳':'');
+      chEl.textContent='Ch'+d.current_channel;
+      progEl.textContent=(d.current_index+1)+'/'+d.total_channels;
+      const delay=d.parallel_group_delay>0?'(+'+d.parallel_group_delay+'s)':'';
+      parEl.textContent=(d.parallel_limit===0?'並列:無制限':'並列:'+d.parallel_limit+'台'+delay)
+        +(d.move_timeout_secs>0?' | timeout:'+d.move_timeout_secs+'s':'')
+        +' | 滞在:'+Math.round(d.dwell_secs)+'s';
+      updatePatrolUI(true);
+    }else{
+      stateEl.className='stopped'; stateEl.textContent='■ 停止中';
+      chEl.textContent=d.last_channel>0?'前回: Ch'+d.last_channel:'';
+      progEl.textContent=''; parEl.textContent='';
+      updatePatrolUI(false);
+    }
+    const fullEl=document.getElementById('ps-full');
+    fullEl.textContent=(d.full_channels&&d.full_channels.length)?'🚫 満員スキップ: Ch'+d.full_channels.join(', Ch'):'';
+  }catch(_){}
+  setTimeout(pollPatrolStatus,2000);
+}
+
+// ── Config ──
+const CFG_FIELDS=[
+  {k:'discord_webhook',label:'Discord Webhook URL',type:'text',desc:'空にするとDiscord通知無効'},
+  {k:'chat_exclude',label:'チャット除外キーワード',type:'csv',desc:'カンマ区切り。例: いない,終わった'},
+  {k:'patrol_dwell_secs',label:'滞在時間 (秒)',type:'number',desc:'ch移動完了後〜次ch移動開始までの待機秒数'},
+  {k:'patrol_move_timeout_secs',label:'移動待ちタイムアウト (秒)',type:'number',desc:'[0x2E]パケットを待つ最大秒数。0=無効'},
+  {k:'parallel_limit',label:'並列切替台数',type:'number',desc:'0=全台同時（ディレイ無効）'},
+  {k:'parallel_group_delay_secs',label:'グループ間ディレイ (秒)',type:'number',desc:'並列台数>0のとき有効'},
+  {k:'adb_path',label:'ADBパス',type:'text',desc:'adb.exeのフルパスまたは「adb」'},
+  {k:'mumu_delay_ms',label:'ADBコマンド間隔 (ms)',type:'number',desc:'各ADBコマンド間の待機時間'},
+  {k:'mumu_tap_x',label:'タップX座標',type:'number',desc:'チャンネル入力欄のタップX'},
+  {k:'mumu_tap_y',label:'タップY座標',type:'number',desc:'チャンネル入力欄のタップY'},
+  {k:'mumu_pre_keycode',label:'プリキーコード',type:'text',desc:'チャンネル入力欄を開くキーコード'},
+];
+let cfgData={};
+async function loadConfig(){
+  cfgData=await fetch('/api/config').then(r=>r.json());
+  document.getElementById('cfg-form').innerHTML=CFG_FIELDS.map(function(f){
+    var val=cfgData[f.k]!==undefined?cfgData[f.k]:'';
+    if(f.type==='csv'&&Array.isArray(val)) val=val.join(',');
+    var inputType=f.type==='csv'?'text':f.type;
+    var noteHtml=f.desc?('<span class="cfg-note">'+f.desc+'</span>'):'';
+    return '<div class="cfg-field"><label>'+f.label+'</label>'
+      +'<input type="'+inputType+'" id="cfg-'+f.k+'" value="'+val+'" placeholder="'+(f.desc||'')+'">'
+      +noteHtml+'</div>';
+  }).join('');
+}
+async function saveConfig(){
+  const updated={...cfgData};
+  CFG_FIELDS.forEach(f=>{
+    const el=document.getElementById('cfg-'+f.k); if(!el) return;
+    if(f.type==='number') updated[f.k]=parseFloat(el.value)||0;
+    else if(f.type==='csv') updated[f.k]=el.value.split(',').map(s=>s.trim()).filter(Boolean);
+    else updated[f.k]=el.value;
+  });
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(updated)});
+  const d=await r.json();
+  const st=document.getElementById('cfg-status');
+  st.textContent=d.ok?'✓ 保存・反映済':'✗ 失敗: '+(d.error||'');
+  setTimeout(()=>st.textContent='',4000);
+  cfgData=updated;
+}
+
+// ── Init ──
 refreshDevices();
+setInterval(refreshDevices,10000);
 loadPatrolChannels();
 pollPatrolStatus();
 loadConfig();
+loadGoldHistory();
+setInterval(loadGoldHistory,30000);
 </script>
 </body>
 </html>`

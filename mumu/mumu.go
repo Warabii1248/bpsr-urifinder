@@ -24,14 +24,14 @@ type Config struct {
 	ClearLength int
 	PreKeycode  string
 	GlobalDelay time.Duration
-	// ParallelLimit は同時に実行するチャンネル切替の最大並列数。
-	// 0 = 無制限（デバイス数分すべて並列、グループディレイも無効）。
+	// ParallelLimit は同時切替の最大台数。0=無制限（グループディレイも無効）。
 	ParallelLimit int
-	// ParallelGroupDelay は各グループの開始前に挿入するウェイト。
-	// ParallelLimit > 0 のときのみ有効。最初のグループはディレイなし。
-	// 例: ParallelLimit=2, ParallelGroupDelay=3s, 6台 →
-	//   t=0s: 台1・台2開始 / t=3s: 台3・台4開始 / t=6s: 台5・台6開始
+	// ParallelGroupDelay はグループ間の待機時間。ParallelLimit>0のとき有効。
 	ParallelGroupDelay time.Duration
+	// MoveTimeout は [0x2E] パケットを待つ最大時間。0=無効（ADB完了即dwell開始）
+	MoveTimeout time.Duration
+	// DwellDuration はch移動完了後〜次ch移動開始までの待機時間
+	DwellDuration time.Duration
 }
 
 // DefaultConfig はデフォルト値を返す
@@ -347,9 +347,12 @@ type PatrolStatus struct {
 	DwellSecs          float64  `json:"dwell_secs"`
 	ParallelLimit      int      `json:"parallel_limit"`
 	ParallelGroupDelay float64  `json:"parallel_group_delay"`
-	LastChannel        uint32   `json:"last_channel"` // 最後に巡回したチャンネル
-	Reversed           bool     `json:"reversed"`     // 逆順巡回中
-	LoopMode           bool     `json:"loop_mode"`    // true=ループ / false=一巡で停止
+	LastChannel        uint32   `json:"last_channel"`      // 最後に巡回したチャンネル
+	Reversed           bool     `json:"reversed"`          // 逆順巡回中
+	LoopMode           bool     `json:"loop_mode"`         // true=ループ / false=一巡で停止
+	WaitingMove        bool     `json:"waiting_move"`      // ch移動完了待ち中
+	MoveTimeoutSecs    float64  `json:"move_timeout_secs"` // 移動待ちタイムアウト(秒)
+	FullChannels       []uint32 `json:"full_channels"`     // 満員と判定してスキップしたch一覧
 }
 
 // PatrolOptions は巡回の追加オプション
@@ -365,7 +368,24 @@ type Patroller struct {
 	mu          sync.RWMutex
 	status      PatrolStatus
 	cancel      context.CancelFunc
-	lastChannel uint32 // 最後に巡回したチャンネル（再開位置の計算に使用）
+	lastChannel uint32        // 最後に巡回したチャンネル（再開位置の計算に使用）
+	moveSignal  chan struct{} // ch移動完了パケット([0x2E])受信ごとに1送信
+}
+
+// NotifyChMovePacket は ncap が [0x2E] パケットを受信したときに呼び出す。
+// 巡回中でない場合は何もしない。
+func (p *Patroller) NotifyChMovePacket() {
+	p.mu.RLock()
+	running := p.status.Running
+	ch := p.moveSignal
+	p.mu.RUnlock()
+	if !running || ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default: // バッファ満杯なら捨てる（ブロックしない）
+	}
 }
 
 // NewPatroller はPatrollerを作成する
@@ -401,6 +421,8 @@ func (p *Patroller) Stop() {
 	}
 	p.status.LastChannel = p.lastChannel
 	p.status.Running = false
+	p.status.WaitingMove = false
+	p.moveSignal = nil
 	p.mu.Unlock()
 	log.Println("[MuMu] 巡回停止")
 }
@@ -445,7 +467,7 @@ func absDiffUint32(a, b uint32) uint32 {
 // channels が空の場合は何もしない。
 // channelsFile が指定されている場合、各チャンネル滞在後にファイル更新を確認し
 // 変更があれば近傍チャンネルから巡回し直す。
-func (p *Patroller) Start(serials []string, channels []uint32, dwellSecs float64, channelsFile string, opts PatrolOptions) {
+func (p *Patroller) Start(serials []string, channels []uint32, channelsFile string, opts PatrolOptions) {
 	if len(channels) == 0 {
 		log.Println("[MuMu] 巡回: チャンネルリストが空のため開始しない")
 		return
@@ -454,8 +476,11 @@ func (p *Patroller) Start(serials []string, channels []uint32, dwellSecs float64
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	p.mu.Lock()
+	cfg := p.cfg
+	p.mu.Unlock()
+
 	// 開始インデックスの決定
-	// StartChannel > 0 なら指定チャンネル優先、それ以外は前回位置から再開
 	var resumeIdx int
 	if opts.StartChannel > 0 {
 		resumeIdx = findResumeIndex(channels, opts.StartChannel)
@@ -463,36 +488,39 @@ func (p *Patroller) Start(serials []string, channels []uint32, dwellSecs float64
 		resumeIdx = findResumeIndex(channels, p.lastChannel)
 	}
 
-	// 逆順の場合: リストをそのままにインデックス操作で逆走する
-	// step = +1(正順) / -1(逆順)
 	step := 1
 	if opts.Reversed {
 		step = -1
-		// 逆順開始時は末尾から（開始Ch指定がなければ）
 		if opts.StartChannel == 0 && p.lastChannel == 0 {
 			resumeIdx = len(channels) - 1
 		}
 	}
 
+	// dwell: cfg.DwellDuration が未設定なら最低5秒
+	dwell := cfg.DwellDuration
+	if dwell < 5*time.Second {
+		dwell = 5 * time.Second
+	}
+
+	// moveSignal: [0x2E]パケット受信ごとに1トークンをバッファリング
+	sig := make(chan struct{}, 64)
+
 	p.mu.Lock()
 	p.cancel = cancel
+	p.moveSignal = sig
 	p.status = PatrolStatus{
 		Running:            true,
 		TotalChannels:      len(channels),
 		Serials:            serials,
-		DwellSecs:          dwellSecs,
-		ParallelLimit:      p.cfg.ParallelLimit,
-		ParallelGroupDelay: p.cfg.ParallelGroupDelay.Seconds(),
+		DwellSecs:          dwell.Seconds(),
+		ParallelLimit:      cfg.ParallelLimit,
+		ParallelGroupDelay: cfg.ParallelGroupDelay.Seconds(),
 		LastChannel:        p.lastChannel,
 		Reversed:           opts.Reversed,
 		LoopMode:           opts.LoopMode,
+		MoveTimeoutSecs:    cfg.MoveTimeout.Seconds(),
 	}
 	p.mu.Unlock()
-
-	dwell := time.Duration(float64(time.Second) * dwellSecs)
-	if dwell < 100*time.Millisecond {
-		dwell = 5 * time.Second
-	}
 
 	// channels.txt の初回モッドタイムを記録
 	var lastModTime time.Time
@@ -519,7 +547,7 @@ func (p *Patroller) Start(serials []string, channels []uint32, dwellSecs float64
 			modeStr = "一巡"
 		}
 		log.Printf("[MuMu] 巡回開始: %d ch, 滞在=%.1fs, 方向=%s, モード=%s, 開始idx=%d",
-			len(channels), dwellSecs, dirStr, modeStr, resumeIdx)
+			len(channels), dwell.Seconds(), dirStr, modeStr, resumeIdx)
 
 		idx := resumeIdx
 		visited := 0 // 一巡モード用カウンタ
@@ -542,19 +570,37 @@ func (p *Patroller) Start(serials []string, channels []uint32, dwellSecs float64
 				return
 			}
 
+			// cfg を毎ループ最新に取得（UpdateConfig による動的変更に対応）
+			p.mu.Lock()
+			currentCfg := p.cfg
+			// dwellも毎回cfgから再取得
+			dwell = currentCfg.DwellDuration
+			if dwell < 5*time.Second {
+				dwell = 5 * time.Second
+			}
+			p.mu.Unlock()
+
 			// デバイス一覧を取得（空なら自動検出）
 			targets := serials
 			if len(targets) == 0 {
-				var err error
-				targets, err = ListDevices(p.cfg)
-				if err != nil {
-					log.Printf("[MuMu] 巡回: デバイス取得失敗: %v", err)
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(3 * time.Second):
+				var devErr error
+				targets, devErr = ListDevices(currentCfg)
+				if devErr != nil || len(targets) == 0 {
+					// ADB認識不能の可能性 → kill-server/start-server で復旧試行
+					log.Printf("[MuMu] 巡回: デバイス取得失敗または0台、ADB再起動を試みます...")
+					if restartErr := RestartServer(currentCfg); restartErr != nil {
+						log.Printf("[MuMu] ADB再起動失敗: %v", restartErr)
 					}
-					continue
+					targets, devErr = ListDevices(currentCfg)
+					if devErr != nil {
+						log.Printf("[MuMu] 巡回: デバイス再取得失敗: %v", devErr)
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(5 * time.Second):
+						}
+						continue
+					}
 				}
 				if len(targets) == 0 {
 					log.Println("[MuMu] 巡回: 対象デバイスが0台。MuMu Playerが起動しているか確認してください")
@@ -568,21 +614,37 @@ func (p *Patroller) Start(serials []string, channels []uint32, dwellSecs float64
 			}
 
 			p.mu.Lock()
-			currentCfg := p.cfg
 			p.status.CurrentChannel = ch
 			p.status.CurrentIndex = normalIdx
 			p.status.Serials = targets
 			p.status.ParallelLimit = currentCfg.ParallelLimit
 			p.status.ParallelGroupDelay = currentCfg.ParallelGroupDelay.Seconds()
+			p.status.DwellSecs = dwell.Seconds()
 			p.lastChannel = ch
 			p.status.LastChannel = ch
 			p.mu.Unlock()
 
 			limit := parallelLimit(currentCfg, len(targets))
-			log.Printf("[MuMu] 巡回: [%d/%d] Ch%d → %d台 (グループ=%d, ディレイ=%.1fs)",
-				normalIdx+1, n, ch, len(targets), limit, currentCfg.ParallelGroupDelay.Seconds())
+			// ParallelLimit=0（無制限）のとき グループ間ディレイは無効
+			groupDelay := currentCfg.ParallelGroupDelay
+			if currentCfg.ParallelLimit <= 0 {
+				groupDelay = 0
+			}
+			log.Printf("[MuMu] 巡回: [%d/%d] Ch%d → %d台 (グループ=%d台, ディレイ=%.1fs, 滞在=%.0fs)",
+				normalIdx+1, n, ch, len(targets), limit,
+				groupDelay.Seconds(), dwell.Seconds())
 
-			// デバイスをグループに分けて順番に切り替える
+			// moveSignal のバッファをフラッシュ（前回の残滓を除去）
+		flushSig:
+			for {
+				select {
+				case <-sig:
+				default:
+					break flushSig
+				}
+			}
+
+			// デバイスをグループに分けて並列切替
 			patrolResults := make(map[string]error, len(targets))
 			var patrolMu sync.Mutex
 			for start := 0; start < len(targets); start += limit {
@@ -590,23 +652,93 @@ func (p *Patroller) Start(serials []string, channels []uint32, dwellSecs float64
 				if end > len(targets) {
 					end = len(targets)
 				}
-				if start > 0 && currentCfg.ParallelGroupDelay > 0 {
+				if start > 0 && groupDelay > 0 {
 					select {
 					case <-ctx.Done():
 						return
-					case <-time.After(currentCfg.ParallelGroupDelay):
+					case <-time.After(groupDelay):
 					}
 				}
 				switchGroup(targets, start, end, ch, currentCfg, patrolResults, &patrolMu)
 			}
+			failCount := 0
 			for serial, err := range patrolResults {
 				if err != nil {
 					log.Printf("[MuMu] 巡回: serial=%s ch=%d 失敗: %v", serial, ch, err)
+					failCount++
 				} else {
 					log.Printf("[MuMu] 巡回: serial=%s ch=%d OK", serial, ch)
 				}
 			}
+			if failCount > 0 {
+				log.Printf("[MuMu] 巡回: Ch%d %d台失敗 → 次回ループでADB再試行", ch, failCount)
+			}
 
+			// ── ch移動完了待ち（[0x2E]シグナル） ──
+			// タイムアウトした場合は満員と判定してスキップ
+			isFull := false
+			if currentCfg.MoveTimeout > 0 {
+				need := len(targets)
+				got := 0
+				p.mu.Lock()
+				p.status.WaitingMove = true
+				p.mu.Unlock()
+				log.Printf("[MuMu] 巡回: Ch%d 移動完了待ち (0/%d台, タイムアウト=%.0fs)",
+					ch, need, currentCfg.MoveTimeout.Seconds())
+				deadline := time.NewTimer(currentCfg.MoveTimeout)
+			waitLoop:
+				for got < need {
+					select {
+					case <-ctx.Done():
+						deadline.Stop()
+						p.mu.Lock()
+						p.status.WaitingMove = false
+						p.mu.Unlock()
+						return
+					case <-deadline.C:
+						// タイムアウト＝シグナルが1件も来ていない → 満員と判定
+						if got == 0 {
+							isFull = true
+							log.Printf("[MuMu] 巡回: Ch%d 満員と判定（移動完了シグナルなし） → スキップ", ch)
+						} else {
+							log.Printf("[MuMu] 巡回: Ch%d 移動待ちタイムアウト (%d/%d台) → 強制進行", ch, got, need)
+						}
+						break waitLoop
+					case <-sig:
+						got++
+						log.Printf("[MuMu] 巡回: Ch%d [0x2E] (%d/%d台)", ch, got, need)
+					}
+				}
+				deadline.Stop()
+				p.mu.Lock()
+				p.status.WaitingMove = false
+				if isFull {
+					// 満員リストに追加（重複なし）
+					alreadyIn := false
+					for _, fc := range p.status.FullChannels {
+						if fc == ch {
+							alreadyIn = true
+							break
+						}
+					}
+					if !alreadyIn {
+						p.status.FullChannels = append(p.status.FullChannels, ch)
+					}
+				}
+				p.mu.Unlock()
+				if !isFull {
+					log.Printf("[MuMu] 巡回: Ch%d 全台移動完了 → 滞在タイマー開始 (%.0fs)", ch, dwell.Seconds())
+				}
+			}
+
+			// 満員の場合は滞在せず次へ
+			if isFull {
+				visited++
+				idx += step
+				continue
+			}
+
+			// 滞在タイマー
 			select {
 			case <-ctx.Done():
 				return

@@ -135,7 +135,9 @@ func main() {
 		PreKeycode:         cfg.MumuPreKeycode,
 		GlobalDelay:        time.Duration(cfg.MumuDelayMs) * time.Millisecond,
 		ParallelLimit:      cfg.ParallelLimit,
-		ParallelGroupDelay: time.Duration(cfg.ParallelGroupDelayMs) * time.Millisecond,
+		ParallelGroupDelay: time.Duration(cfg.ParallelGroupDelaySecs * float64(time.Second)),
+		MoveTimeout:        time.Duration(cfg.PatrolMoveTimeoutSecs * float64(time.Second)),
+		DwellDuration:      time.Duration(cfg.PatrolDwellSecs * float64(time.Second)),
 	}
 
 	var patrolChannels []uint32
@@ -149,7 +151,7 @@ func main() {
 	}
 
 	// GUI サーバーを作成
-	guiServer := gui.New(cfg.GUIPort, mumuCfg, patrolChannels, cfg.PatrolDwellSecs, cfg.PatrolChannelsFile)
+	guiServer := gui.New(cfg.GUIPort, mumuCfg, patrolChannels, cfg.PatrolChannelsFile)
 
 	// 全ログ行をGUIのSSEにも流す
 	log.SetOutput(guiServer.LogWriter(log.Writer()))
@@ -219,6 +221,17 @@ func main() {
 			return appconfig.Save(*configPath, c)
 		},
 	)
+
+	// 時間系設定の Patroller へのリアルタイム反映
+	guiServer.SetCfgUpdater(func(dwellSecs, moveTimeoutSecs, groupDelaySecs float64, parallelLimit int) {
+		newCfg := mumuCfg
+		newCfg.DwellDuration = time.Duration(dwellSecs * float64(time.Second))
+		newCfg.MoveTimeout = time.Duration(moveTimeoutSecs * float64(time.Second))
+		newCfg.ParallelGroupDelay = time.Duration(groupDelaySecs * float64(time.Second))
+		newCfg.ParallelLimit = parallelLimit
+		mumuCfg = newCfg
+		guiServer.UpdatePatrollerCfg(newCfg)
+	})
 
 	go func() {
 		if startErr := capDevice.Start(); startErr != nil {
