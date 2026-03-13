@@ -135,7 +135,9 @@ func main() {
 		PreKeycode:         cfg.MumuPreKeycode,
 		GlobalDelay:        time.Duration(cfg.MumuDelayMs) * time.Millisecond,
 		ParallelLimit:      cfg.ParallelLimit,
-		ParallelGroupDelay: time.Duration(cfg.ParallelGroupDelayMs) * time.Millisecond,
+		ParallelGroupDelay: time.Duration(cfg.ParallelGroupDelaySecs * float64(time.Second)),
+		MoveTimeout:        time.Duration(cfg.PatrolMoveTimeoutSecs * float64(time.Second)),
+		DwellDuration:      time.Duration(cfg.PatrolDwellSecs * float64(time.Second)),
 	}
 
 	var patrolChannels []uint32
@@ -149,7 +151,7 @@ func main() {
 	}
 
 	// GUI サーバーを作成
-	guiServer := gui.New(cfg.GUIPort, mumuCfg, patrolChannels, cfg.PatrolDwellSecs, cfg.PatrolChannelsFile)
+	guiServer := gui.New(cfg.GUIPort, mumuCfg, patrolChannels, cfg.PatrolChannelsFile)
 
 	// 全ログ行をGUIのSSEにも流す
 	log.SetOutput(guiServer.LogWriter(log.Writer()))
@@ -239,6 +241,8 @@ func main() {
 		if err := guiServer.RunWindow(ctx); err != nil {
 			log.Printf("GUI error: %v", err)
 		}
+		// ウィンドウが閉じられたら明示的にキャンセル（goroutine終了）
+		cancel()
 	} else {
 		log.Println("GUI disabled (gui_port=0)")
 		sig := make(chan os.Signal, 1)
