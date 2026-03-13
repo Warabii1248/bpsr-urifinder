@@ -37,8 +37,8 @@ type DeviceSessionInfo struct {
 type Server struct {
 	port               int
 	patroller          *mumu.Patroller
-	patrolChannels     []uint32 // 起動時に設定から読み込んだチャンネルリスト
-	patrolChannelsFile string   // channels.txt パス（ホットリロード用）
+	patrolChannels     []uint32             // 起動時に設定から読み込んだチャンネルリスト
+	patrolChannelsFile string               // channels.txt パス（ホットリロード用）
 	getSessions        func() []DeviceSessionInfo
 	testDetectFn       func()
 	saveChannelsFn     func([]uint32) error
@@ -429,7 +429,6 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	var results []result
 
 	cfg := s.patroller.Config()
-<<<<<<< HEAD
 
 	// serials が指定されていれば複数切替、なければ単体切替
 	serials := req.Serials
@@ -437,20 +436,13 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 		// 何も指定なし → 全台を ListDevices で取得
 		var err error
 		serials, err = mumu.ListDevices(cfg)
-=======
-	if req.All {
-		serials, err := mumu.ListDevices(cfg)
->>>>>>> 7f5fd63d3507012596a9036ec018032890ddb7c4
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-<<<<<<< HEAD
 	}
 
 	if len(serials) > 0 {
-=======
->>>>>>> 7f5fd63d3507012596a9036ec018032890ddb7c4
 		switchResults := make(map[string]error, len(serials))
 		var switchMu sync.Mutex
 		limit := mumu.ParallelLimit(cfg, len(serials))
@@ -472,10 +464,7 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 			results = append(results, r)
 		}
 	} else {
-<<<<<<< HEAD
 		// 単体切替
-=======
->>>>>>> 7f5fd63d3507012596a9036ec018032890ddb7c4
 		err := mumu.SwitchChannel(req.Serial, req.Channel, cfg)
 		r := result{Serial: req.Serial, OK: err == nil}
 		if err != nil {
@@ -570,13 +559,13 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if s.getConfigFn != nil {
 			if savedData, rerr := s.getConfigFn(); rerr == nil {
 				var appCfg struct {
-					ADBPath                string  `json:"adb_path"`
-					MumuTapX               int     `json:"mumu_tap_x"`
-					MumuTapY               int     `json:"mumu_tap_y"`
-					MumuClearLength        int     `json:"mumu_clear_length"`
-					MumuPreKeycode         string  `json:"mumu_pre_keycode"`
-					MumuDelayMs            int     `json:"mumu_delay_ms"`
-					ParallelLimit          int     `json:"parallel_limit"`
+					ADBPath              string  `json:"adb_path"`
+					MumuTapX             int     `json:"mumu_tap_x"`
+					MumuTapY             int     `json:"mumu_tap_y"`
+					MumuClearLength      int     `json:"mumu_clear_length"`
+					MumuPreKeycode       string  `json:"mumu_pre_keycode"`
+					MumuDelayMs          int     `json:"mumu_delay_ms"`
+					ParallelLimit        int     `json:"parallel_limit"`
 					ParallelGroupDelaySecs float64 `json:"parallel_group_delay_secs"`
 					PatrolMoveTimeoutSecs  float64 `json:"patrol_move_timeout_secs"`
 					PatrolDwellSecs        float64 `json:"patrol_dwell_secs"`
@@ -1151,7 +1140,6 @@ async function switchAll(){
   const ch=document.getElementById('allch').value;
   const bar=document.getElementById('status-bar');
   bar.textContent='切替中...';
-<<<<<<< HEAD
   const serials=selectedSerials(); // 空 = 全台
   const r=await fetch('/api/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:parseInt(ch),serials})});
   const d=await r.json();
@@ -1161,11 +1149,6 @@ async function switchAll(){
   } else {
     bar.textContent=d.error?'✗ '+d.error:'✗ 失敗';
   }
-=======
-  const r=await fetch('/api/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:parseInt(ch),serials:selectedSerials()})});
-  const d=await r.json();
-  bar.textContent=d.ok?'✓ 完了':'✗ '+(d.error||'失敗');
->>>>>>> 7f5fd63d3507012596a9036ec018032890ddb7c4
   setTimeout(()=>bar.textContent='',3000);
 }
 async function switchOne(serial){
@@ -1174,12 +1157,8 @@ async function switchOne(serial){
   bar.textContent='切替中...';
   const r=await fetch('/api/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch,serial})});
   const d=await r.json();
-<<<<<<< HEAD
   const res=d.results&&d.results[0];
   bar.textContent=res&&res.ok?'✓ 完了':'✗ '+(res&&res.error||d.error||'失敗');
-=======
-  bar.textContent=d.ok?'✓ 完了':'✗ '+(d.error||'失敗');
->>>>>>> 7f5fd63d3507012596a9036ec018032890ddb7c4
   setTimeout(()=>bar.textContent='',3000);
 }
 

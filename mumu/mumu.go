@@ -236,6 +236,7 @@ func SwitchGroup(serials []string, start, end int, channel uint32, cfg Config, r
 	wg.Wait()
 }
 
+
 // GetDeviceIP は指定デバイスの仮想NWインターフェースIPを返す。
 // "adb -s <serial> shell ip route get 1" の出力から src フィールドをパースする。
 func GetDeviceIP(serial string, cfg Config) (string, error) {
@@ -316,12 +317,12 @@ type PatrolStatus struct {
 	DwellSecs          float64  `json:"dwell_secs"`
 	ParallelLimit      int      `json:"parallel_limit"`
 	ParallelGroupDelay float64  `json:"parallel_group_delay"`
-	LastChannel        uint32   `json:"last_channel"`      // 最後に巡回したチャンネル
-	Reversed           bool     `json:"reversed"`          // 逆順巡回中
-	LoopMode           bool     `json:"loop_mode"`         // true=ループ / false=一巡で停止
-	WaitingMove        bool     `json:"waiting_move"`      // ch移動完了待ち中
-	MoveTimeoutSecs    float64  `json:"move_timeout_secs"` // 移動待ちタイムアウト(秒)
-	FullChannels       []uint32 `json:"full_channels"`     // 満員と判定してスキップしたch一覧
+	LastChannel        uint32   `json:"last_channel"`        // 最後に巡回したチャンネル
+	Reversed           bool     `json:"reversed"`             // 逆順巡回中
+	LoopMode           bool     `json:"loop_mode"`            // true=ループ / false=一巡で停止
+	WaitingMove        bool     `json:"waiting_move"`         // ch移動完了待ち中
+	MoveTimeoutSecs    float64  `json:"move_timeout_secs"`    // 移動待ちタイムアウト(秒)
+	FullChannels       []uint32 `json:"full_channels"`        // 満員と判定してスキップしたch一覧
 }
 
 // PatrolOptions は巡回の追加オプション
@@ -337,7 +338,7 @@ type Patroller struct {
 	mu          sync.RWMutex
 	status      PatrolStatus
 	cancel      context.CancelFunc
-	lastChannel uint32         // 最後に巡回したチャンネル（再開位置の計算に使用）
+	lastChannel uint32        // 最後に巡回したチャンネル（再開位置の計算に使用）
 	moveSignal  chan time.Time // ch移動完了パケット([0x2E])受信ごとに受信時刻を送信
 }
 

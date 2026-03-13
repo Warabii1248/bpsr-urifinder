@@ -164,6 +164,7 @@ func main() {
 		guiServer.OnDetect(det)
 	}
 
+
 	capDevice := ncap.NewCapDevice(handle, selectedDesc)
 	capDevice.SetNotifier(onDetect)
 	if locStore != nil {
