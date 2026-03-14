@@ -72,6 +72,19 @@ func adb(serial string, cfg Config, args ...string) (string, error) {
 	return runAdb(cfg, full...)
 }
 
+// EnsureServer は ADB サーバーが起動していることを確認し、未起動なら起動する。
+// RestartServer と異なり kill-server は行わないため既存接続を維持できる。
+func EnsureServer(cfg Config) error {
+	log.Println("[MuMu] adb start-server...")
+	out, err := newCmd(cfg.ADBPath, "start-server").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("adb start-server: %w\n%s", err, string(out))
+	}
+	log.Println("[MuMu] ADB サーバー起動確認完了")
+	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+
 // RestartServer は adb kill-server → adb start-server でADBサーバーを再起動する。
 // ADB接続が切れた場合の復旧に使用する。
 func RestartServer(cfg Config) error {

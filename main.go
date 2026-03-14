@@ -150,6 +150,11 @@ func main() {
 		}
 	}
 
+	// 起動時に ADB サーバーを確実に起動する（未起動の場合の検知失敗を防ぐ）
+	if err := mumu.EnsureServer(mumuCfg); err != nil {
+		log.Printf("warn: ADB サーバー起動失敗（検知に影響する可能性あり）: %v", err)
+	}
+
 	// GUI サーバーを作成
 	guiServer := gui.New(cfg.GUIPort, mumuCfg, patrolChannels, cfg.PatrolChannelsFile)
 
@@ -195,9 +200,12 @@ func main() {
 		return out
 	})
 
-	// テスト通知ボタン用：プレイヤー位置をゴールドウリボ検知として発火
+	// テスト通知ボタン用：ダミーDetectionを直接 onDetect に渡す（ADBデバイス不要）
 	guiServer.SetTestDetectFn(func() {
-		capDevice.ForceDetect()
+		onDetect(notifier.Detection{
+			Time:   time.Now(),
+			LineID: 999, // テスト用チャンネル番号
+		})
 	})
 
 	// チャンネルリストをファイルに保存するコールバック
